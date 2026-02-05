@@ -1,0 +1,28 @@
+[project]
+name = "etsy-scraper"
+version = "0.1.0"
+description = "使用真实 Chrome 浏览器的 Etsy 爬虫"
+authors = [
+    {name = "chrisleeli",email = "chrisleeli@tencent.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+dependencies = [
+    "selenium (>=4.15.0)",
+    "requests (>=2.31.0)",
+    "pyqt6 (>=6.10.2,<7.0.0)",
+    "pyinstaller (>=6.18.0,<7.0.0)",
+    "customtkinter (>=5.2.2,<6.0.0)"
+]
+
+[project.scripts]
+etsy-real = "etsy_scraper.real_chrome_scraper:main"
+etsy-section = "etsy_scraper.section_scraper:main"
+etsy-gui = "etsy_scraper.gui:main"
+
+[tool.poetry]
+packages = [{include = "etsy_scraper", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
