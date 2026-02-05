@@ -62,7 +62,17 @@ def build_app():
         "--noconfirm", # Overwrite existing files
         "--clean",     # Clean temp files
         
-        # Hidden imports
+        # Add source files
+        "--add-data", f"src/etsy_scraper/section_scraper.py{os.pathsep}.",
+        "--add-data", f"src/etsy_scraper/real_chrome_scraper.py{os.pathsep}.",
+        "--add-data", f"src/etsy_scraper/utils.py{os.pathsep}.",
+        
+        # Hidden imports - our modules
+        "--hidden-import", "section_scraper",
+        "--hidden-import", "real_chrome_scraper", 
+        "--hidden-import", "utils",
+        
+        # Hidden imports - dependencies
         "--hidden-import", "selenium",
         "--hidden-import", "selenium.webdriver",
         "--hidden-import", "selenium.webdriver.chrome.options",
