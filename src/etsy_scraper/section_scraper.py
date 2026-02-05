@@ -153,13 +153,22 @@ class ScrapeProgress:
         return self._total_found
 
 # 复用 real_chrome_scraper 的核心函数
-from .real_chrome_scraper import (
-    sanitize_filename,
-    get_chrome_path,
-    start_chrome_with_debug,
-    wait_for_chrome_ready,
-    extract_data_with_selenium,
-)
+try:
+    from .real_chrome_scraper import (
+        sanitize_filename,
+        get_chrome_path,
+        start_chrome_with_debug,
+        wait_for_chrome_ready,
+        extract_data_with_selenium,
+    )
+except ImportError:
+    from real_chrome_scraper import (
+        sanitize_filename,
+        get_chrome_path,
+        start_chrome_with_debug,
+        wait_for_chrome_ready,
+        extract_data_with_selenium,
+    )
 
 
 def parse_section_url(url: str) -> Tuple[str, str]:
@@ -524,7 +533,10 @@ def download_images_to_section(
         return 0
     
     # 应用标题过滤
-    from .utils import filter_title
+    try:
+        from .utils import filter_title
+    except ImportError:
+        from utils import filter_title
     display_name = product_name
     if filter_words:
         display_name = filter_title(product_name, filter_words)
@@ -838,7 +850,10 @@ def main():
     args = parser.parse_args()
     
     # 解析图片选择和过滤词参数
-    from .utils import parse_image_selection, parse_filter_words
+    try:
+        from .utils import parse_image_selection, parse_filter_words
+    except ImportError:
+        from utils import parse_image_selection, parse_filter_words
     
     image_selection = None
     filter_words = None

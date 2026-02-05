@@ -13,16 +13,27 @@ from typing import Optional, List, Set
 
 import customtkinter as ctk
 
-# 导入核心功能
-from .section_scraper import (
-    ScrapeProgress, parse_section_url, get_section_info,
-    extract_product_links, process_product, ImageNameTracker,
-    start_chrome_with_debug, wait_for_chrome_ready
-)
-from .real_chrome_scraper import (
-    extract_data_with_selenium, download_images, sanitize_filename
-)
-from .utils import parse_image_selection, parse_filter_words
+# 导入核心功能 - 兼容 PyInstaller 打包
+try:
+    from .section_scraper import (
+        ScrapeProgress, parse_section_url, get_section_info,
+        extract_product_links, process_product, ImageNameTracker,
+        start_chrome_with_debug, wait_for_chrome_ready
+    )
+    from .real_chrome_scraper import (
+        extract_data_with_selenium, download_images, sanitize_filename
+    )
+    from .utils import parse_image_selection, parse_filter_words
+except ImportError:
+    from section_scraper import (
+        ScrapeProgress, parse_section_url, get_section_info,
+        extract_product_links, process_product, ImageNameTracker,
+        start_chrome_with_debug, wait_for_chrome_ready
+    )
+    from real_chrome_scraper import (
+        extract_data_with_selenium, download_images, sanitize_filename
+    )
+    from utils import parse_image_selection, parse_filter_words
 
 
 # 设置主题
@@ -268,7 +279,10 @@ class ScraperWorker:
         if not images or not title:
             return
         
-        from .utils import filter_title
+        try:
+            from .utils import filter_title
+        except ImportError:
+            from utils import filter_title
         display_title = title
         if self.filter_words:
             display_title = filter_title(title, self.filter_words)

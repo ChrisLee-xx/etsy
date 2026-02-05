@@ -376,7 +376,10 @@ def download_images(images: List[str], title: str, output_dir: Path,
         return
     
     # 应用标题过滤
-    from .utils import filter_title
+    try:
+        from .utils import filter_title
+    except ImportError:
+        from utils import filter_title
     display_title = title
     if filter_words:
         display_title = filter_title(title, filter_words)
@@ -468,7 +471,10 @@ def main():
     args = parser.parse_args()
     
     # 解析图片选择和过滤词参数
-    from .utils import parse_image_selection, parse_filter_words
+    try:
+        from .utils import parse_image_selection, parse_filter_words
+    except ImportError:
+        from utils import parse_image_selection, parse_filter_words
     
     image_selection = None
     filter_words = None
