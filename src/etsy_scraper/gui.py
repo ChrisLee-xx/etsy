@@ -2,6 +2,7 @@
 Etsy Scraper GUI - CustomTkinter 桌面应用
 """
 import json
+import os
 import random
 import sys
 import threading
@@ -10,6 +11,13 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Set
+
+# PyInstaller 打包后，添加 _MEIPASS 到 sys.path
+if getattr(sys, 'frozen', False):
+    # Running as compiled
+    bundle_dir = sys._MEIPASS
+    if bundle_dir not in sys.path:
+        sys.path.insert(0, bundle_dir)
 
 import customtkinter as ctk
 
