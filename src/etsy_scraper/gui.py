@@ -26,7 +26,8 @@ try:
     from .section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
-        start_chrome_with_debug, wait_for_chrome_ready
+        start_chrome_with_debug, wait_for_chrome_ready,
+        sanitize_folder_name
     )
     from .real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename
@@ -36,7 +37,8 @@ except ImportError:
     from section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
-        start_chrome_with_debug, wait_for_chrome_ready
+        start_chrome_with_debug, wait_for_chrome_ready,
+        sanitize_folder_name
     )
     from real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename
@@ -47,6 +49,40 @@ except ImportError:
 # 设置主题
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
+
+
+def _get_config_dir() -> Path:
+    """获取配置文件目录"""
+    config_dir = Path.home() / ".etsy_scraper"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir
+
+
+def _get_config_path() -> Path:
+    """获取配置文件路径"""
+    return _get_config_dir() / "config.json"
+
+
+def load_config() -> dict:
+    """加载保存的配置"""
+    config_path = _get_config_path()
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(data: dict):
+    """保存配置到文件"""
+    config_path = _get_config_path()
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def get_default_download_folder() -> str:
@@ -229,7 +265,29 @@ class ScraperWorker:
                     self.log(f"  ❌ 导航失败: {e}")
                     continue
             
-            section_dir_name = f"{shop_name}_{section_id}"
+            # 获取 Section 信息（在创建输出目录之前）
+            section_name, total_items = get_section_info(self.driver, section_id)
+            self.log(f"  Section: {section_name} ({total_items} 件)")
+            
+            # 使用 section 名称命名文件夹
+            if section_name and section_name != "section":
+                section_dir_name = sanitize_folder_name(section_name)
+            else:
+                section_dir_name = f"{shop_name}_{section_id}"
+            
+            # 同名文件夹冲突检测
+            candidate_path = Path(self.output_dir) / section_dir_name
+            if candidate_path.exists():
+                progress_file = candidate_path / ".progress.json"
+                if progress_file.exists():
+                    try:
+                        with open(progress_file, 'r', encoding='utf-8') as f:
+                            existing_progress = json.load(f)
+                        if existing_progress.get('section_id') != section_id:
+                            section_dir_name = f"{section_dir_name}_{section_id}"
+                    except Exception:
+                        pass
+            
             output_path = Path(self.output_dir) / section_dir_name
             output_path.mkdir(parents=True, exist_ok=True)
             
@@ -243,7 +301,7 @@ class ScraperWorker:
                 except:
                     pass
             
-            listing_ids = extract_product_links(self.driver, url)
+            listing_ids = extract_product_links(self.driver, url, total_items=total_items)
             
             if not listing_ids:
                 self.log("  ❌ 没有找到商品")
@@ -334,6 +392,10 @@ class App(ctk.CTk):
         self.worker: Optional[ScraperWorker] = None
         
         self.setup_ui()
+        self._load_saved_config()
+        
+        # 关闭窗口时保存配置
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
     
     def setup_ui(self):
         # 主容器
@@ -746,6 +808,35 @@ class App(ctk.CTk):
             self.progress_label.configure(text="❌ 失败")
             if "取消" not in message:
                 messagebox.showerror("错误", message)
+
+
+    def _load_saved_config(self):
+        """启动时加载上次保存的配置"""
+        config = load_config()
+        
+        # 恢复过滤词
+        product_filter = config.get('product_filter', '')
+        if product_filter:
+            self.product_filter.insert(0, product_filter)
+        
+        section_filter = config.get('section_filter', '')
+        if section_filter:
+            self.section_filter.insert(0, section_filter)
+    
+    def _save_current_config(self):
+        """保存当前配置"""
+        config = load_config()
+        
+        # 保存过滤词
+        config['product_filter'] = self.product_filter.get().strip()
+        config['section_filter'] = self.section_filter.get().strip()
+        
+        save_config(config)
+    
+    def _on_close(self):
+        """关闭窗口时保存配置"""
+        self._save_current_config()
+        self.destroy()
 
 
 def main():

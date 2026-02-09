@@ -9,6 +9,7 @@ Section Scraper - 批量抓取 Etsy 店铺 Section 下的所有商品图片
 """
 import argparse
 import json
+import math
 import random
 import re
 import sys
@@ -17,7 +18,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -171,6 +172,30 @@ except ImportError:
     )
 
 
+def sanitize_folder_name(name: str) -> str:
+    """
+    清理文件夹名称，替换文件系统非法字符
+    
+    Args:
+        name: 原始名称
+        
+    Returns:
+        安全的文件夹名称
+    """
+    # 替换文件系统非法字符为 _
+    unsafe_chars = r'/\:*?"<>|'
+    result = name
+    for char in unsafe_chars:
+        result = result.replace(char, '_')
+    # 去除首尾空白
+    result = result.strip()
+    # 合并连续下划线
+    result = re.sub(r'_+', '_', result)
+    # 去除首尾下划线
+    result = result.strip('_')
+    return result
+
+
 def parse_section_url(url: str) -> Tuple[str, str]:
     """
     解析 Section URL，提取 shop_name 和 section_id
@@ -202,31 +227,68 @@ def parse_section_url(url: str) -> Tuple[str, str]:
     return shop_name, section_id
 
 
-def extract_product_links(driver, section_url: str) -> List[str]:
+def build_page_url(section_url: str, page: int) -> str:
     """
-    从 Section 页面提取所有商品链接
+    构造带 page 参数的 Section 页面 URL
+    
+    Args:
+        section_url: 原始 Section URL
+        page: 页码（从 1 开始）
+        
+    Returns:
+        带 page=N 参数的 URL
+    """
+    parsed = urlparse(section_url)
+    query_params = parse_qs(parsed.query, keep_blank_values=True)
+    query_params['page'] = [str(page)]
+    # 将多值参数扁平化为单值
+    new_query = urlencode({k: v[0] for k, v in query_params.items()})
+    new_url = urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path,
+        parsed.params, new_query, ''
+    ))
+    return new_url
+
+
+def extract_product_links(driver, section_url: str, total_items: int = 0) -> List[str]:
+    """
+    从 Section 页面提取所有商品链接（基于 URL 参数翻页）
+    
+    翻页策略：
+    1. 先抓取第 1 页，获取实际每页商品数 (items_per_page)
+    2. 结合 total_items 计算总页数: ceil(total_items / items_per_page)
+    3. 从第 2 页开始逐页构造 URL 访问
     
     Args:
         driver: Selenium WebDriver 实例
         section_url: Section 页面 URL
+        total_items: Section 总商品数（用于计算总页数，0 则逐页探测）
         
     Returns:
         商品 listing_id 列表
     """
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
     
     all_listing_ids = []
     seen_ids = set()
+    items_per_page = 0  # 从第一页动态获取
+    total_pages = None
     current_page = 1
     
-    # 导航到 Section 页面
-    driver.get(section_url)
-    time.sleep(3)  # 等待页面加载
+    print(f"\n📊 Section 总商品数: {total_items}" if total_items > 0 else "\n📊 总商品数未知，将逐页探测")
     
     while True:
-        print(f"\n📄 正在处理第 {current_page} 页...")
+        # 构造当前页 URL
+        page_url = build_page_url(section_url, current_page)
+        
+        if total_pages is not None:
+            print(f"\n📄 正在处理第 {current_page}/{total_pages} 页...")
+        else:
+            print(f"\n📄 正在处理第 {current_page} 页...")
+        
+        # 导航到当前页
+        driver.get(page_url)
+        time.sleep(3)  # 等待页面加载
         
         # 滚动页面以触发懒加载
         scroll_page(driver)
@@ -248,16 +310,34 @@ def extract_product_links(driver, section_url: str) -> List[str]:
             
             print(f"  ✓ 本页找到 {len(page_ids)} 个新商品")
             
+            # 如果本页无新商品，停止翻页
+            if not page_ids:
+                print("  → 本页无新商品，停止翻页")
+                break
+            
+            # 第一页抓取完成后，动态计算每页商品数和总页数
+            if current_page == 1 and total_items > 0:
+                items_per_page = len(page_ids)
+                total_pages = math.ceil(total_items / items_per_page)
+                print(f"  📊 每页 {items_per_page} 个商品，预计共 {total_pages} 页")
+                
+                # 如果只有 1 页，直接结束
+                if total_pages <= 1:
+                    print(f"  → 仅 1 页，无需翻页")
+                    break
+            
         except Exception as e:
             print(f"  ✗ 提取商品失败: {e}")
-        
-        # 检查是否有下一页
-        if not click_next_page(driver):
-            print("  → 没有更多页面了")
             break
         
+        # 检查是否已到达最后一页
+        if total_pages is not None:
+            if current_page >= total_pages:
+                print(f"  → 已到达最后一页 ({current_page}/{total_pages})")
+                break
+        
         current_page += 1
-        time.sleep(2)  # 等待下一页加载
+        time.sleep(2)  # 翻页间延迟
     
     return all_listing_ids
 
@@ -283,68 +363,6 @@ def scroll_page(driver, scroll_times: int = 5):
     # 滚动回顶部
     driver.execute_script("window.scrollTo(0, 0)")
     time.sleep(0.5)
-
-
-def click_next_page(driver) -> bool:
-    """
-    点击下一页按钮
-    
-    Args:
-        driver: Selenium WebDriver 实例
-        
-    Returns:
-        是否成功点击下一页（False 表示没有下一页）
-    """
-    from selenium.webdriver.common.by import By
-    
-    try:
-        # 查找分页导航中的下一页按钮
-        # 方法1: 查找 aria-label 包含 "Next" 或 "下一页" 的链接
-        next_selectors = [
-            'nav[aria-label*="Pagination"] a[aria-label*="Next"]',
-            'nav[aria-label*="Pagination"] a[aria-label*="next"]',
-            'nav[aria-label*="pagination"] a[data-page]',
-            'a.wt-action-group__item-container[aria-label*="Next"]',
-        ]
-        
-        for selector in next_selectors:
-            try:
-                next_buttons = driver.find_elements(By.CSS_SELECTOR, selector)
-                for btn in next_buttons:
-                    # 检查是否是真正的"下一页"按钮（不是数字页码）
-                    aria_label = btn.get_attribute('aria-label') or ''
-                    if 'next' in aria_label.lower() or '下一' in aria_label:
-                        # 检查是否可点击（没有 disabled 属性）
-                        if btn.is_enabled() and btn.is_displayed():
-                            btn.click()
-                            return True
-            except:
-                continue
-        
-        # 方法2: 查找当前页码，尝试点击下一个数字
-        try:
-            current_page = driver.find_element(
-                By.CSS_SELECTOR, 
-                'nav[aria-label*="Pagination"] a[aria-current="page"]'
-            )
-            current_num = int(current_page.text.strip())
-            
-            # 查找下一个页码
-            next_page_link = driver.find_element(
-                By.CSS_SELECTOR,
-                f'nav[aria-label*="Pagination"] a[data-page="{current_num + 1}"]'
-            )
-            if next_page_link.is_displayed():
-                next_page_link.click()
-                return True
-        except:
-            pass
-        
-        return False
-        
-    except Exception as e:
-        print(f"  翻页失败: {e}")
-        return False
 
 
 def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
@@ -892,14 +910,28 @@ def main():
     # 处理 --clear-progress 参数
     if args.clear_progress:
         cleared = 0
+        output_base = Path(args.output)
         for s in sections:
-            section_dir_name = f"{s['shop_name']}_{s['section_id']}"
-            output_path = Path(args.output) / section_dir_name
-            progress_file = output_path / ".progress.json"
-            if progress_file.exists():
-                progress_file.unlink()
-                print(f"✓ 已清理: {progress_file}")
-                cleared += 1
+            target_section_id = s['section_id']
+            found = False
+            # 扫描所有子目录，查找匹配 section_id 的进度文件
+            if output_base.exists():
+                for subdir in output_base.iterdir():
+                    if subdir.is_dir():
+                        progress_file = subdir / ".progress.json"
+                        if progress_file.exists():
+                            try:
+                                with open(progress_file, 'r', encoding='utf-8') as f:
+                                    data = json.load(f)
+                                if data.get('section_id') == target_section_id:
+                                    progress_file.unlink()
+                                    print(f"✓ 已清理: {progress_file}")
+                                    cleared += 1
+                                    found = True
+                            except Exception:
+                                pass
+            if not found:
+                print(f"⚠️ 未找到 Section {target_section_id} 的进度文件")
         if cleared == 0:
             print("⚠️ 没有找到任何进度文件")
         else:
@@ -996,8 +1028,31 @@ def main():
                     print(f"  ❌ 导航失败: {e}")
                     continue
             
-            # 创建输出目录
-            section_dir_name = f"{shop_name}_{section_id}"
+            # 获取 Section 信息（在创建输出目录之前获取 section 名称）
+            print(f"\n  📌 获取 Section 信息...")
+            section_name, total_items = get_section_info(driver, section_id)
+            print(f"    Section: {section_name}")
+            print(f"    预计商品数: {total_items}")
+            
+            # 创建输出目录（使用 section 实际名称）
+            if section_name and section_name != "section":
+                section_dir_name = sanitize_folder_name(section_name)
+            else:
+                section_dir_name = f"{shop_name}_{section_id}"
+            
+            # 同名文件夹冲突检测
+            candidate_path = Path(args.output) / section_dir_name
+            if candidate_path.exists():
+                progress_file = candidate_path / ".progress.json"
+                if progress_file.exists():
+                    try:
+                        with open(progress_file, 'r', encoding='utf-8') as f:
+                            existing_progress = json.load(f)
+                        if existing_progress.get('section_id') != section_id:
+                            section_dir_name = f"{section_dir_name}_{section_id}"
+                    except Exception:
+                        pass
+            
             output_path = Path(args.output) / section_dir_name
             output_path.mkdir(parents=True, exist_ok=True)
             print(f"  输出目录: {output_path}")
@@ -1019,13 +1074,8 @@ def main():
             # 提取商品链接
             print(f"\n  📌 提取商品链接...")
             
-            # 获取 Section 信息
-            section_name, total_items = get_section_info(driver, section_id)
-            print(f"    Section: {section_name}")
-            print(f"    预计商品数: {total_items}")
-            
-            # 提取所有商品链接
-            listing_ids = extract_product_links(driver, url)
+            # 提取所有商品链接（传入 total_items 用于计算翻页）
+            listing_ids = extract_product_links(driver, url, total_items=total_items)
             
             if not listing_ids:
                 print(f"\n  ❌ 没有找到任何商品！")
