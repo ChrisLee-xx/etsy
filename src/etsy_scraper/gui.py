@@ -85,22 +85,32 @@ def save_config(data: dict):
         pass
 
 
-def get_default_download_folder() -> str:
-    """获取系统默认下载文件夹"""
-    import platform
-    home = Path.home()
+def get_default_output_folder() -> str:
+    """获取默认输出文件夹：桌面/EtsyScraper_YYYYMMDD，自动复用同日期文件夹"""
+    desktop = Path.home() / "Desktop"
+    if not desktop.exists():
+        desktop = Path.home()
     
-    if platform.system() == "Darwin":  # macOS
-        downloads = home / "Downloads"
-    elif platform.system() == "Windows":
-        downloads = home / "Downloads"
-    else:  # Linux
-        downloads = home / "Downloads"
+    today = datetime.now().strftime("%Y%m%d")
+    target_name = f"EtsyScraper_{today}"
+    target_path = desktop / target_name
     
-    # 如果下载文件夹存在，返回它；否则返回用户主目录
-    if downloads.exists():
-        return str(downloads)
-    return str(home)
+    # 如果今天的文件夹已存在，直接复用
+    if target_path.exists():
+        return str(target_path)
+    
+    # 查找桌面上最近的 EtsyScraper_ 文件夹，如果存在则复用
+    existing = sorted(
+        [d for d in desktop.iterdir() if d.is_dir() and d.name.startswith("EtsyScraper_")],
+        key=lambda p: p.name,
+        reverse=True
+    )
+    if existing:
+        return str(existing[0])
+    
+    # 没有已有文件夹，创建今天的
+    target_path.mkdir(parents=True, exist_ok=True)
+    return str(target_path)
 
 
 class ScraperWorker:
@@ -425,11 +435,13 @@ class App(ctk.CTk):
         self.tabview = ctk.CTkTabview(self.main_frame, height=320)
         self.tabview.pack(fill="x", pady=(0, 15))
         
-        self.tabview.add("📦 单商品抓取")
         self.tabview.add("📂 Section 批量")
+        self.tabview.add("📦 单商品抓取")
         
-        self.setup_product_tab(self.tabview.tab("📦 单商品抓取"))
         self.setup_section_tab(self.tabview.tab("📂 Section 批量"))
+        self.setup_product_tab(self.tabview.tab("📦 单商品抓取"))
+        
+        self.tabview.set("📂 Section 批量")
         
         # ========== 进度条和按钮（放在日志上方） ==========
         control_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
@@ -519,7 +531,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(row1, text="输出目录：", font=ctk.CTkFont(size=14), width=100).pack(side="left")
         self.product_output = ctk.CTkEntry(row1, font=ctk.CTkFont(size=14), height=40)
         self.product_output.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.product_output.insert(0, get_default_download_folder())
+        self.product_output.insert(0, get_default_output_folder())
         
         browse_btn = ctk.CTkButton(
             row1, text="浏览...", width=80, height=40,
@@ -597,7 +609,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(row1, text="输出目录：", font=ctk.CTkFont(size=14), width=100).pack(side="left")
         self.section_output = ctk.CTkEntry(row1, font=ctk.CTkFont(size=14), height=40)
         self.section_output.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.section_output.insert(0, get_default_download_folder())
+        self.section_output.insert(0, get_default_output_folder())
         
         browse_btn = ctk.CTkButton(
             row1, text="浏览...", width=80, height=40,
