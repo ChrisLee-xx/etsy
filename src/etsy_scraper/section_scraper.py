@@ -764,7 +764,8 @@ def process_all_products(
     delay: float = 2.0,
     image_selection: List[int] = None,
     filter_words: List[str] = None,
-    progress: ScrapeProgress = None
+    progress: ScrapeProgress = None,
+    name_tracker: ImageNameTracker = None
 ) -> Tuple[int, int]:
     """
     批量处理所有商品
@@ -777,6 +778,7 @@ def process_all_products(
         image_selection: 要下载的图片序号列表
         filter_words: 标题过滤词列表
         progress: 进度管理器（可选）
+        name_tracker: 文件名追踪器（可选，用于跨批次保持一致的命名）
         
     Returns:
         Tuple[成功数, 失败数]
@@ -784,7 +786,8 @@ def process_all_products(
     total = len(listing_ids)
     success_count = 0
     fail_count = 0
-    name_tracker = ImageNameTracker()
+    if name_tracker is None:
+        name_tracker = ImageNameTracker()
     
     print(f"\n{'='*60}")
     print(f"开始处理 {total} 个商品")
@@ -814,6 +817,62 @@ def process_all_products(
             time.sleep(wait_time)
     
     return success_count, fail_count
+
+
+def restart_chrome(chrome_process, url: str, port: int, cooldown: int = 30):
+    """
+    重启 Chrome 浏览器以避免被 Etsy 限制访问
+    
+    会清理 Chrome profile（cookies/缓存），并等待冷却时间让限制消退。
+    
+    Args:
+        chrome_process: 当前 Chrome 进程
+        url: 重启后打开的 URL
+        port: Chrome 调试端口
+        cooldown: 冷却等待秒数（让 Etsy 的 IP/会话限制消退）
+        
+    Returns:
+        Tuple[new_chrome_process, new_driver]
+    """
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    
+    print(f"\n{'='*60}")
+    print("🔄 重启 Chrome 浏览器以避免访问限制")
+    print(f"{'='*60}")
+    
+    # 关闭当前 Chrome
+    try:
+        chrome_process.terminate()
+    except Exception:
+        pass
+    time.sleep(2)
+    
+    # 冷却等待
+    if cooldown > 0:
+        print(f"\n⏳ 冷却等待 {cooldown} 秒，让 Etsy 限制消退...")
+        for remaining in range(cooldown, 0, -10):
+            print(f"    剩余 {remaining} 秒...")
+            time.sleep(min(10, remaining))
+        print("  ✓ 冷却完成")
+    
+    input("\n准备好后按 Enter 重启 Chrome...")
+    
+    # 清理 profile 后启动新 Chrome
+    new_chrome_process = start_chrome_with_debug(url, port, clean=True)
+    if not wait_for_chrome_ready(port):
+        print("❌ Chrome 重启失败！")
+        return None, None
+    
+    print("✓ Chrome 已重启（已清理旧 cookies）！")
+    print("\n请在浏览器中完成验证（如需要）")
+    input("✋ 验证完成后按 Enter 继续抓取...")
+    
+    options = Options()
+    options.add_experimental_option("debuggerAddress", f"localhost:{port}")
+    new_driver = webdriver.Chrome(options=options)
+    
+    return new_chrome_process, new_driver
 
 
 def main():
@@ -855,6 +914,10 @@ def main():
                         help="指定下载哪些图片，如: '1' 或 '1,3,5' 或 '2-4' 或 '1,3-5,8'")
     parser.add_argument("--filter", "-f", default=None,
                         help="从标题中过滤的词汇，逗号分隔，如: 'Canvas,Poster,Wall Art'")
+    parser.add_argument("--restart-every", type=int, default=0,
+                        help="每抓取 N 个商品后重启 Chrome 避免被限制（0=不重启，默认: 0）")
+    parser.add_argument("--restart-cooldown", type=int, default=30,
+                        help="重启 Chrome 前的冷却等待秒数（默认: 30）")
     
     # 断点续传参数
     resume_group = parser.add_mutually_exclusive_group()
@@ -1113,18 +1176,50 @@ def main():
             # 处理商品
             print(f"\n  📌 下载商品图片 ({len(pending_ids)} 个)...")
             
-            success, fail = process_all_products(
-                driver, 
-                pending_ids, 
-                output_path,
-                delay=args.delay,
-                image_selection=image_selection,
-                filter_words=filter_words,
-                progress=progress
-            )
+            # 分批处理（如果启用了定期重启 Chrome）
+            restart_every = args.restart_every
+            name_tracker = ImageNameTracker()
             
-            total_success += success
-            total_fail += fail
+            if restart_every > 0 and len(pending_ids) > restart_every:
+                processed = 0
+                while processed < len(pending_ids):
+                    batch = pending_ids[processed:processed + restart_every]
+                    
+                    success, fail = process_all_products(
+                        driver, batch, output_path,
+                        delay=args.delay,
+                        image_selection=image_selection,
+                        filter_words=filter_words,
+                        progress=progress,
+                        name_tracker=name_tracker
+                    )
+                    total_success += success
+                    total_fail += fail
+                    processed += len(batch)
+                    
+                    # 如果还有剩余商品，重启 Chrome
+                    if processed < len(pending_ids):
+                        remaining = len(pending_ids) - processed
+                        print(f"\n  📊 已处理 {processed} 个，剩余 {remaining} 个")
+                        
+                        chrome_process, driver = restart_chrome(
+                            chrome_process, url, args.port,
+                            cooldown=args.restart_cooldown
+                        )
+                        if driver is None:
+                            print("  ❌ Chrome 重启失败，停止处理")
+                            break
+            else:
+                success, fail = process_all_products(
+                    driver, pending_ids, output_path,
+                    delay=args.delay,
+                    image_selection=image_selection,
+                    filter_words=filter_words,
+                    progress=progress,
+                    name_tracker=name_tracker
+                )
+                total_success += success
+                total_fail += fail
             
             # Section 完成状态
             if progress.completed_count == len(listing_ids):

@@ -49,11 +49,36 @@ def get_chrome_path() -> Optional[str]:
     return None
 
 
-def start_chrome_with_debug(url: str, port: int = 9222) -> subprocess.Popen:
-    """启动带调试端口的 Chrome"""
+def clean_chrome_profile():
+    """清理 Chrome profile 目录中的 cookies 和缓存，保留基本配置"""
+    import shutil
+    profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
+    if not profile_dir.exists():
+        return
+    
+    # 删除整个 profile 目录来彻底清除 cookies/缓存/限制标记
+    try:
+        shutil.rmtree(profile_dir)
+        print("  ✓ 已清理 Chrome profile（cookies/缓存）")
+    except Exception as e:
+        print(f"  ⚠️ 清理 Chrome profile 失败: {e}")
+
+
+def start_chrome_with_debug(url: str, port: int = 9222, clean: bool = False) -> subprocess.Popen:
+    """
+    启动带调试端口的 Chrome
+    
+    Args:
+        url: 打开的 URL
+        port: 调试端口
+        clean: 是否先清理 profile（清除 cookies/缓存）
+    """
     chrome_path = get_chrome_path()
     if not chrome_path:
         raise RuntimeError("找不到 Chrome！")
+    
+    if clean:
+        clean_chrome_profile()
     
     # 创建临时用户目录避免与现有 Chrome 冲突
     temp_user_dir = Path.home() / ".etsy_scraper_chrome_profile"

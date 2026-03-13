@@ -30,7 +30,8 @@ try:
         sanitize_folder_name
     )
     from .real_chrome_scraper import (
-        extract_data_with_selenium, download_images, sanitize_filename
+        extract_data_with_selenium, download_images, sanitize_filename,
+        clean_chrome_profile
     )
     from .utils import parse_image_selection, parse_filter_words
 except ImportError:
@@ -41,7 +42,8 @@ except ImportError:
         sanitize_folder_name
     )
     from real_chrome_scraper import (
-        extract_data_with_selenium, download_images, sanitize_filename
+        extract_data_with_selenium, download_images, sanitize_filename,
+        clean_chrome_profile
     )
     from utils import parse_image_selection, parse_filter_words
 
@@ -121,7 +123,8 @@ class ScraperWorker:
                  filter_words: Optional[List[str]] = None,
                  delay: float = 2.0,
                  resume: bool = True,
-                 port: int = 9222):
+                 port: int = 9222,
+                 restart_every: int = 0):
         self.app = app
         self.mode = mode
         self.urls = urls
@@ -131,6 +134,7 @@ class ScraperWorker:
         self.delay = delay
         self.resume = resume
         self.port = port
+        self.restart_every = restart_every
         self.chrome_process = None
         self.driver = None
         self._stop_flag = False
@@ -327,6 +331,7 @@ class ScraperWorker:
                 continue
             
             name_tracker = ImageNameTracker()
+            products_since_restart = 0
             
             for i, listing_id in enumerate(pending_ids, 1):
                 if self._stop_flag:
@@ -341,6 +346,63 @@ class ScraperWorker:
                     progress.save(listing_id)
                 else:
                     total_fail += 1
+                
+                products_since_restart += 1
+                
+                # 定期重启 Chrome 避免被限制
+                if (self.restart_every > 0
+                        and products_since_restart >= self.restart_every
+                        and i < len(pending_ids)):
+                    remaining = len(pending_ids) - i
+                    self.log(f"\n🔄 已处理 {products_since_restart} 个，重启 Chrome（剩余 {remaining} 个）")
+                    
+                    try:
+                        self.driver.quit()
+                    except Exception:
+                        pass
+                    try:
+                        self.chrome_process.terminate()
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    
+                    # 冷却等待
+                    self.log("⏳ 冷却等待 30 秒，让 Etsy 限制消退...")
+                    for remaining in range(30, 0, -10):
+                        if self._stop_flag:
+                            break
+                        self.log(f"    剩余 {remaining} 秒...")
+                        time.sleep(min(10, remaining))
+                    
+                    if self._stop_flag:
+                        break
+                    
+                    self.log("🚀 清理旧 cookies，重新启动 Chrome...")
+                    clean_chrome_profile()
+                    self.chrome_process = start_chrome_with_debug(url, self.port)
+                    if not wait_for_chrome_ready(self.port):
+                        self.log("❌ Chrome 重启失败！")
+                        break
+                    
+                    self.log("✅ Chrome 已重启（已清理旧 cookies）！请完成验证后点击「继续抓取」")
+                    self._user_confirmed = False
+                    self.app.after(0, self.app.on_chrome_ready)
+                    
+                    while not self._user_confirmed and not self._stop_flag:
+                        time.sleep(0.5)
+                    
+                    if self._stop_flag:
+                        break
+                    
+                    from selenium import webdriver
+                    from selenium.webdriver.chrome.options import Options
+                    options = Options()
+                    options.add_experimental_option("debuggerAddress", f"localhost:{self.port}")
+                    self.driver = webdriver.Chrome(options=options)
+                    
+                    products_since_restart = 0
+                    self.log("✅ 继续抓取...")
+                    continue
                 
                 if i < len(pending_ids):
                     time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
@@ -662,6 +724,21 @@ class App(ctk.CTk):
         self.section_resume.pack(side="left", padx=(30, 0))
         self.section_resume.select()
         
+        # 第五行：重启间隔
+        row5 = ctk.CTkFrame(options_frame, fg_color="transparent")
+        row5.pack(fill="x", pady=8)
+        
+        ctk.CTkLabel(row5, text="重启间隔：", font=ctk.CTkFont(size=14), width=100).pack(side="left")
+        self.section_restart_every = ctk.CTkEntry(
+            row5, font=ctk.CTkFont(size=14), height=40, width=80,
+            placeholder_text="0"
+        )
+        self.section_restart_every.pack(side="left")
+        ctk.CTkLabel(
+            row5, text="个商品后重启Chrome（0=不重启，防止被Etsy限制）",
+            font=ctk.CTkFont(size=12), text_color="gray"
+        ).pack(side="left", padx=(8, 0))
+        
         # 开始按钮
         self.section_start_btn = ctk.CTkButton(
             parent,
@@ -767,6 +844,15 @@ class App(ctk.CTk):
             messagebox.showerror("错误", "延迟和端口必须是数字！")
             return
         
+        restart_every = 0
+        restart_text = self.section_restart_every.get().strip()
+        if restart_text:
+            try:
+                restart_every = int(restart_text)
+            except ValueError:
+                messagebox.showerror("错误", "重启间隔必须是整数！")
+                return
+        
         self.start_worker(
             mode='section',
             urls=urls,
@@ -775,7 +861,8 @@ class App(ctk.CTk):
             filter_words=filter_words,
             delay=delay,
             resume=self.section_resume.get(),
-            port=port
+            port=port,
+            restart_every=restart_every
         )
     
     def start_worker(self, **kwargs):
@@ -834,6 +921,11 @@ class App(ctk.CTk):
         section_filter = config.get('section_filter', '')
         if section_filter:
             self.section_filter.insert(0, section_filter)
+        
+        # 恢复重启间隔
+        restart_every = config.get('restart_every', '')
+        if restart_every:
+            self.section_restart_every.insert(0, str(restart_every))
     
     def _save_current_config(self):
         """保存当前配置"""
@@ -842,6 +934,14 @@ class App(ctk.CTk):
         # 保存过滤词
         config['product_filter'] = self.product_filter.get().strip()
         config['section_filter'] = self.section_filter.get().strip()
+        
+        # 保存重启间隔
+        restart_text = self.section_restart_every.get().strip()
+        if restart_text:
+            try:
+                config['restart_every'] = int(restart_text)
+            except ValueError:
+                pass
         
         save_config(config)
     
