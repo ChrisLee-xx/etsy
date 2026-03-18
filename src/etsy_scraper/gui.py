@@ -31,7 +31,7 @@ try:
     )
     from .real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
-        clean_chrome_profile
+        clean_chrome_profile, apply_stealth
     )
     from .utils import parse_image_selection, parse_filter_words
 except ImportError:
@@ -43,7 +43,7 @@ except ImportError:
     )
     from real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
-        clean_chrome_profile
+        clean_chrome_profile, apply_stealth
     )
     from utils import parse_image_selection, parse_filter_words
 
@@ -192,6 +192,7 @@ class ScraperWorker:
             options = Options()
             options.add_experimental_option("debuggerAddress", f"localhost:{self.port}")
             self.driver = webdriver.Chrome(options=options)
+            apply_stealth(self.driver)
             
             if self.mode == 'product':
                 self._scrape_products()
@@ -399,6 +400,7 @@ class ScraperWorker:
                     options = Options()
                     options.add_experimental_option("debuggerAddress", f"localhost:{self.port}")
                     self.driver = webdriver.Chrome(options=options)
+                    apply_stealth(self.driver)
                     
                     products_since_restart = 0
                     self.log("✅ 继续抓取...")
