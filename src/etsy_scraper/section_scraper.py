@@ -161,6 +161,7 @@ try:
         start_chrome_with_debug,
         wait_for_chrome_ready,
         extract_data_with_selenium,
+        apply_stealth,
     )
 except ImportError:
     from real_chrome_scraper import (
@@ -169,6 +170,7 @@ except ImportError:
         start_chrome_with_debug,
         wait_for_chrome_ready,
         extract_data_with_selenium,
+        apply_stealth,
     )
 
 
@@ -634,7 +636,7 @@ def process_product(driver, listing_id: str, output_dir: Path, name_tracker: Ima
     try:
         # 导航到商品页面
         driver.get(product_url)
-        time.sleep(random.uniform(2, 4))  # 随机延迟
+        time.sleep(random.uniform(3, 6))  # 模拟人类阅读停顿
         
         # 使用 real_chrome_scraper 的数据提取函数
         # 但我们需要跳过验证检测（因为已经在 Section 页面验证过了）
@@ -682,13 +684,19 @@ def extract_product_data_silent(driver) -> Optional[Dict]:
     
     data = {}
     
-    # 模拟人类滚动
-    for _ in range(2):
-        scroll_distance = random.randint(200, 400)
+    # 模拟人类浏览：先停顿"看一下"页面，再随机滚动
+    time.sleep(random.uniform(0.5, 1.5))
+    scroll_count = random.randint(2, 4)
+    for _ in range(scroll_count):
+        scroll_distance = random.randint(150, 500)
         driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-        time.sleep(random.uniform(0.3, 0.8))
+        time.sleep(random.uniform(0.4, 1.2))
+    # 偶尔往回滚一点
+    if random.random() < 0.3:
+        driver.execute_script(f"window.scrollBy(0, -{random.randint(100, 200)})")
+        time.sleep(random.uniform(0.3, 0.6))
     driver.execute_script("window.scrollTo(0, 0)")
-    time.sleep(0.5)
+    time.sleep(random.uniform(0.3, 0.8))
     
     # 提取标题
     try:
@@ -809,10 +817,13 @@ def process_all_products(
         else:
             fail_count += 1
         
-        # 随机延迟，避免被封
+        # 随机延迟，模拟人类浏览节奏
         if i < total:
-            wait_time = delay + random.uniform(-0.5, 1.0)
-            wait_time = max(1.0, wait_time)  # 至少等待 1 秒
+            base_wait = delay + random.uniform(0, 2.0)
+            # 偶尔加一个较长的停顿（模拟人在"仔细看"某个商品）
+            if random.random() < 0.15:
+                base_wait += random.uniform(3, 8)
+            wait_time = max(2.0, base_wait)
             print(f"    ⏳ 等待 {wait_time:.1f} 秒...")
             time.sleep(wait_time)
     
@@ -871,6 +882,7 @@ def restart_chrome(chrome_process, url: str, port: int, cooldown: int = 30):
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
     new_driver = webdriver.Chrome(options=options)
+    apply_stealth(new_driver)
     
     return new_chrome_process, new_driver
 
@@ -1056,6 +1068,7 @@ def main():
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{args.port}")
     driver = webdriver.Chrome(options=options)
+    apply_stealth(driver)
     
     # 统计
     total_success = 0
