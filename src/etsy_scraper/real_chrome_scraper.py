@@ -91,11 +91,49 @@ def start_chrome_with_debug(url: str, port: int = 9222, clean: bool = False) -> 
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
         f"--window-size={random.randint(1200, 1920)},{random.randint(800, 1080)}",
         url
     ]
     
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def apply_stealth(driver):
+    """
+    注入反检测脚本，隐藏 Selenium/WebDriver 指纹。
+    必须在每次创建 driver 连接后调用。
+    """
+    try:
+        # 通过 CDP 命令在页面加载前注入脚本，覆盖 navigator.webdriver
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                // 伪造 chrome.runtime（正常 Chrome 有，Selenium 没有）
+                if (!window.chrome) { window.chrome = {}; }
+                if (!window.chrome.runtime) { window.chrome.runtime = {}; }
+                // 伪造 Plugins（无头浏览器通常为空）
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                // 伪造 languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en', 'zh-CN']
+                });
+                // 移除 Selenium 注入的 cdc_ 变量
+                const cleanCdc = () => {
+                    for (const key of Object.keys(document)) {
+                        if (key.match(/^cdc_|^\\$cdc_/)) { delete document[key]; }
+                    }
+                };
+                cleanCdc();
+                const observer = new MutationObserver(cleanCdc);
+                observer.observe(document, {childList: true, subtree: true});
+            """
+        })
+    except Exception:
+        pass
 
 
 def wait_for_chrome_ready(port: int = 9222, timeout: int = 30) -> bool:
@@ -125,6 +163,7 @@ def extract_data_with_selenium(port: int = 9222) -> Optional[Dict]:
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
     
     driver = webdriver.Chrome(options=options)
+    apply_stealth(driver)
     
     try:
         # 获取当前 URL
@@ -572,6 +611,7 @@ def main():
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{args.port}")
     driver = webdriver.Chrome(options=options)
+    apply_stealth(driver)
     
     # 步骤 3：处理所有链接
     print("\n📌 步骤 3: 提取数据")
