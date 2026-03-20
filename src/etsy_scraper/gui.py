@@ -31,7 +31,8 @@ try:
     )
     from .real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
-        clean_chrome_profile, apply_stealth
+        clean_chrome_profile, apply_stealth,
+        detect_access_block, get_random_ua, simulate_mouse_movement,
     )
     from .utils import parse_image_selection, parse_filter_words
 except ImportError:
@@ -43,7 +44,8 @@ except ImportError:
     )
     from real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
-        clean_chrome_profile, apply_stealth
+        clean_chrome_profile, apply_stealth,
+        detect_access_block, get_random_ua, simulate_mouse_movement,
     )
     from utils import parse_image_selection, parse_filter_words
 
@@ -153,6 +155,38 @@ class ScraperWorker:
     def user_confirm(self):
         self._user_confirmed = True
     
+    def _on_block_detected(self, driver) -> bool:
+        """
+        GUI 模式的封锁回调：通知用户并等待验证通过。
+        自动轮询页面状态，用户在浏览器里过完验证后自动继续。
+        """
+        self.log("")
+        self.log("━" * 45)
+        self.log("⚠️  检测到 Etsy 访问限制！")
+        self.log("   请在浏览器中完成人机验证")
+        self.log("   验证通过后会自动继续")
+        self.log("━" * 45)
+        self.app.after(0, lambda: self.app.on_block_detected())
+
+        timeout = 300
+        start = time.time()
+        while time.time() - start < timeout:
+            if self._stop_flag:
+                return False
+            time.sleep(3)
+            if not detect_access_block(driver):
+                self.log("✅ 验证通过，继续抓取...")
+                self.app.after(0, lambda: self.app.on_block_resolved())
+                time.sleep(random.uniform(2, 4))
+                return True
+            elapsed = int(time.time() - start)
+            if elapsed % 15 == 0:
+                self.log(f"   等待验证中... ({elapsed}s)")
+
+        self.log("❌ 等待超时（5分钟），验证未通过")
+        self.app.after(0, lambda: self.app.on_block_resolved())
+        return False
+    
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -226,17 +260,36 @@ class ScraperWorker:
                 try:
                     self.driver.get(url)
                     time.sleep(2)
+                    # 导航后检测封锁
+                    if detect_access_block(self.driver):
+                        resolved = self._on_block_detected(self.driver)
+                        if not resolved:
+                            self.log("  ❌ 验证未通过，跳过")
+                            fail_count += 1
+                            continue
+                        self.driver.get(url)
+                        time.sleep(2)
                 except Exception as e:
                     self.log(f"  ❌ 导航失败: {e}")
                     fail_count += 1
                     continue
             
+            simulate_mouse_movement(self.driver)
             result = extract_data_with_selenium(self.port)
             
             if not result or not result.get('title'):
-                self.log("  ❌ 抓取失败！")
-                fail_count += 1
-                continue
+                # 检查是否被封锁导致失败
+                if detect_access_block(self.driver):
+                    resolved = self._on_block_detected(self.driver)
+                    if resolved:
+                        self.driver.get(url)
+                        time.sleep(2)
+                        result = extract_data_with_selenium(self.port)
+                
+                if not result or not result.get('title'):
+                    self.log("  ❌ 抓取失败！")
+                    fail_count += 1
+                    continue
             
             success_count += 1
             self.log(f"  ✅ {result.get('title', '')[:40]}...")
@@ -342,7 +395,8 @@ class ScraperWorker:
                 
                 if process_product(self.driver, listing_id, output_path, name_tracker,
                                   image_selection=self.image_selection,
-                                  filter_words=self.filter_words):
+                                  filter_words=self.filter_words,
+                                  on_block_detected=self._on_block_detected):
                     total_success += 1
                     progress.save(listing_id)
                 else:
@@ -434,25 +488,40 @@ class ScraperWorker:
         else:
             download_list = [(i+1, url) for i, url in enumerate(images)]
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Referer": "https://www.etsy.com/"
-        }
-        
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": get_random_ua(),
+            "Referer": "https://www.etsy.com/",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+
         for idx, url in download_list:
-            try:
-                ext = url.split('.')[-1].split('?')[0] or 'jpg'
-                filename = f"{safe_title}-{idx}.{ext}"
-                filepath = output_dir / filename
-                
-                resp = requests.get(url, headers=headers, timeout=30)
-                if resp.status_code == 200:
-                    filepath.write_bytes(resp.content)
-                    self.log(f"    📥 图片 {idx}")
-            except:
-                self.log(f"    ❌ 图片 {idx} 下载失败")
+            for attempt in range(3):
+                try:
+                    if attempt > 0:
+                        session.headers["User-Agent"] = get_random_ua()
+                        time.sleep(random.uniform(1, 3))
+                    resp = session.get(url, timeout=30)
+                    if resp.status_code == 200:
+                        ext = url.split('.')[-1].split('?')[0] or 'jpg'
+                        filename = f"{safe_title}-{idx}.{ext}"
+                        filepath = output_dir / filename
+                        filepath.write_bytes(resp.content)
+                        self.log(f"    📥 图片 {idx}")
+                        break
+                    elif resp.status_code == 429:
+                        time.sleep(random.uniform(5, 10))
+                    else:
+                        self.log(f"    ❌ 图片 {idx} (HTTP {resp.status_code})")
+                        break
+                except Exception:
+                    if attempt >= 2:
+                        self.log(f"    ❌ 图片 {idx} 下载失败")
             
             time.sleep(random.uniform(0.3, 0.8))
+        
+        session.close()
 
 
 class App(ctk.CTk):
@@ -893,6 +962,16 @@ class App(ctk.CTk):
         if self.worker:
             self.worker.stop()
             self.log("⚠️ 正在停止...")
+    
+    def on_block_detected(self):
+        """封锁检测触发：更新 UI 提示用户去浏览器过验证"""
+        self.progress_label.configure(text="⚠️ 需要验证")
+        self.progress_bar.configure(progress_color="#ff9800")
+    
+    def on_block_resolved(self):
+        """封锁解除：恢复正常 UI 状态"""
+        self.progress_label.configure(text="抓取中...")
+        self.progress_bar.configure(progress_color=["#3a7ebf", "#1f538d"])
     
     def on_finished(self, success: bool, message: str):
         self.product_start_btn.configure(state="normal")

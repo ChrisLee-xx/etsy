@@ -162,6 +162,11 @@ try:
         wait_for_chrome_ready,
         extract_data_with_selenium,
         apply_stealth,
+        detect_access_block,
+        wait_for_block_resolution,
+        get_random_ua,
+        human_like_delay,
+        simulate_mouse_movement,
     )
 except ImportError:
     from real_chrome_scraper import (
@@ -171,6 +176,11 @@ except ImportError:
         wait_for_chrome_ready,
         extract_data_with_selenium,
         apply_stealth,
+        detect_access_block,
+        wait_for_block_resolution,
+        get_random_ua,
+        human_like_delay,
+        simulate_mouse_movement,
     )
 
 
@@ -288,14 +298,21 @@ def extract_product_links(driver, section_url: str, total_items: int = 0) -> Lis
         else:
             print(f"\n📄 正在处理第 {current_page} 页...")
         
-        # 导航到当前页
         driver.get(page_url)
-        time.sleep(3)  # 等待页面加载
+        time.sleep(3)
         
-        # 滚动页面以触发懒加载
+        # 翻页后检测封锁
+        if detect_access_block(driver):
+            print("  ⚠️ 翻页时检测到访问限制，等待用户验证...")
+            resolved = wait_for_block_resolution(driver)
+            if not resolved:
+                print("  ❌ 验证未通过，停止翻页")
+                break
+            driver.get(page_url)
+            time.sleep(3)
+        
         scroll_page(driver)
         
-        # 提取当前页的商品 listing_id
         try:
             product_cards = driver.find_elements(
                 By.CSS_SELECTOR, 
@@ -339,32 +356,33 @@ def extract_product_links(driver, section_url: str, total_items: int = 0) -> Lis
                 break
         
         current_page += 1
-        time.sleep(2)  # 翻页间延迟
+        time.sleep(human_like_delay(2.0))
     
     return all_listing_ids
 
 
 def scroll_page(driver, scroll_times: int = 5):
     """
-    滚动页面以触发懒加载
-    
-    Args:
-        driver: Selenium WebDriver 实例
-        scroll_times: 滚动次数
+    滚动页面以触发懒加载，模拟真人浏览节奏
     """
-    for i in range(scroll_times):
-        # 随机滚动距离
-        scroll_distance = random.randint(300, 600)
+    simulate_mouse_movement(driver)
+    
+    for i in range(random.randint(scroll_times - 1, scroll_times + 2)):
+        scroll_distance = random.randint(250, 650)
         driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-        time.sleep(random.uniform(0.3, 0.8))
+        time.sleep(random.uniform(0.4, 1.0))
+        # 偶尔稍微往回滚一点
+        if random.random() < 0.2:
+            driver.execute_script(f"window.scrollBy(0, -{random.randint(50, 150)})")
+            time.sleep(random.uniform(0.2, 0.5))
     
-    # 滚动到底部确保所有内容加载
+    simulate_mouse_movement(driver)
+    
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(1)
+    time.sleep(random.uniform(0.8, 1.5))
     
-    # 滚动回顶部
     driver.execute_script("window.scrollTo(0, 0)")
-    time.sleep(0.5)
+    time.sleep(random.uniform(0.3, 0.8))
 
 
 def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
@@ -580,43 +598,54 @@ def download_images_to_section(
     else:
         download_list = [(i+1, url) for i, url in enumerate(images)]
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Referer": "https://www.etsy.com/"
-    }
-    
     downloaded = 0
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": get_random_ua(),
+        "Referer": "https://www.etsy.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
     for idx, url in download_list:
-        try:
-            # 获取文件扩展名
-            ext = url.split('.')[-1].split('?')[0] or 'jpg'
-            if ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
-                ext = 'jpg'
-            
-            # 生成文件名
-            filename = f"{safe_name}-{idx}{suffix}.{ext}"
-            filepath = output_dir / filename
-            
-            # 下载图片
-            resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 200:
-                filepath.write_bytes(resp.content)
-                print(f"    ✓ {filename}")
-                downloaded += 1
-            else:
-                print(f"    ✗ {filename} (HTTP {resp.status_code})")
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    session.headers["User-Agent"] = get_random_ua()
+                    time.sleep(random.uniform(1, 3))
                 
-        except Exception as e:
-            print(f"    ✗ 图片 {idx} 下载失败: {e}")
+                resp = session.get(url, timeout=30)
+                if resp.status_code == 200:
+                    ext = url.split('.')[-1].split('?')[0] or 'jpg'
+                    if ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
+                        ext = 'jpg'
+                    filename = f"{safe_name}-{idx}{suffix}.{ext}"
+                    filepath = output_dir / filename
+                    filepath.write_bytes(resp.content)
+                    print(f"    ✓ {filename}")
+                    downloaded += 1
+                    break
+                elif resp.status_code == 429:
+                    print(f"    ⏳ 图片 {idx} 被限速，等待后重试...")
+                    time.sleep(random.uniform(5, 10))
+                else:
+                    print(f"    ✗ {safe_name}-{idx} (HTTP {resp.status_code})")
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    continue
+                print(f"    ✗ 图片 {idx} 下载失败: {e}")
         
-        # 短暂延迟
         time.sleep(random.uniform(0.2, 0.5))
+    
+    session.close()
     
     return downloaded
 
 
 def process_product(driver, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
-                    image_selection: List[int] = None, filter_words: List[str] = None) -> bool:
+                    image_selection: List[int] = None, filter_words: List[str] = None,
+                    on_block_detected=None) -> bool:
     """
     处理单个商品：导航、提取数据、下载图片
     
@@ -627,6 +656,7 @@ def process_product(driver, listing_id: str, output_dir: Path, name_tracker: Ima
         name_tracker: 文件名跟踪器
         image_selection: 要下载的图片序号列表
         filter_words: 标题过滤词列表
+        on_block_detected: 封锁回调 (driver) -> bool，返回 True 表示已解除
         
     Returns:
         是否成功处理
@@ -634,19 +664,43 @@ def process_product(driver, listing_id: str, output_dir: Path, name_tracker: Ima
     product_url = f"https://www.etsy.com/listing/{listing_id}"
     
     try:
-        # 导航到商品页面
         driver.get(product_url)
-        time.sleep(random.uniform(3, 6))  # 模拟人类阅读停顿
-        
-        # 使用 real_chrome_scraper 的数据提取函数
-        # 但我们需要跳过验证检测（因为已经在 Section 页面验证过了）
+        time.sleep(random.uniform(3, 6))
+
+        # 检测是否被封锁
+        if detect_access_block(driver):
+            print(f"    ⚠️ 检测到访问限制！")
+            if on_block_detected:
+                resolved = on_block_detected(driver)
+            else:
+                resolved = wait_for_block_resolution(driver)
+            if not resolved:
+                print(f"    ❌ 验证未通过，跳过此商品")
+                return False
+            # 验证通过后重新导航
+            driver.get(product_url)
+            time.sleep(random.uniform(3, 6))
+
+        simulate_mouse_movement(driver)
         data = extract_product_data_silent(driver)
         
         if not data or not data.get('title'):
-            print(f"    ⚠️ 无法提取商品数据")
-            return False
+            # 二次检查：可能抓取途中被封
+            if detect_access_block(driver):
+                print(f"    ⚠️ 抓取过程中被限制！")
+                if on_block_detected:
+                    resolved = on_block_detected(driver)
+                else:
+                    resolved = wait_for_block_resolution(driver)
+                if resolved:
+                    driver.get(product_url)
+                    time.sleep(random.uniform(3, 6))
+                    data = extract_product_data_silent(driver)
+            
+            if not data or not data.get('title'):
+                print(f"    ⚠️ 无法提取商品数据")
+                return False
         
-        # 下载图片
         images = data.get('images', [])
         if images:
             downloaded = download_images_to_section(
@@ -684,17 +738,18 @@ def extract_product_data_silent(driver) -> Optional[Dict]:
     
     data = {}
     
-    # 模拟人类浏览：先停顿"看一下"页面，再随机滚动
+    # 模拟人类浏览行为
     time.sleep(random.uniform(0.5, 1.5))
+    simulate_mouse_movement(driver)
     scroll_count = random.randint(2, 4)
     for _ in range(scroll_count):
         scroll_distance = random.randint(150, 500)
         driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
         time.sleep(random.uniform(0.4, 1.2))
-    # 偶尔往回滚一点
     if random.random() < 0.3:
         driver.execute_script(f"window.scrollBy(0, -{random.randint(100, 200)})")
         time.sleep(random.uniform(0.3, 0.6))
+    simulate_mouse_movement(driver)
     driver.execute_script("window.scrollTo(0, 0)")
     time.sleep(random.uniform(0.3, 0.8))
     
@@ -773,7 +828,8 @@ def process_all_products(
     image_selection: List[int] = None,
     filter_words: List[str] = None,
     progress: ScrapeProgress = None,
-    name_tracker: ImageNameTracker = None
+    name_tracker: ImageNameTracker = None,
+    on_block_detected=None
 ) -> Tuple[int, int]:
     """
     批量处理所有商品
@@ -787,6 +843,7 @@ def process_all_products(
         filter_words: 标题过滤词列表
         progress: 进度管理器（可选）
         name_tracker: 文件名追踪器（可选，用于跨批次保持一致的命名）
+        on_block_detected: 封锁回调 (driver) -> bool
         
     Returns:
         Tuple[成功数, 失败数]
@@ -794,6 +851,7 @@ def process_all_products(
     total = len(listing_ids)
     success_count = 0
     fail_count = 0
+    consecutive_fails = 0
     if name_tracker is None:
         name_tracker = ImageNameTracker()
     
@@ -809,21 +867,24 @@ def process_all_products(
         print(f"\n[{i}/{total}] 商品 ID: {listing_id}")
         
         if process_product(driver, listing_id, output_dir, name_tracker,
-                          image_selection=image_selection, filter_words=filter_words):
+                          image_selection=image_selection, filter_words=filter_words,
+                          on_block_detected=on_block_detected):
             success_count += 1
-            # 成功后立即保存进度
+            consecutive_fails = 0
             if progress:
                 progress.save(listing_id)
         else:
             fail_count += 1
+            consecutive_fails += 1
+            # 连续失败多次 → 可能被限制，主动冷却
+            if consecutive_fails >= 3:
+                cooldown = random.uniform(15, 30)
+                print(f"    ⚠️ 连续失败 {consecutive_fails} 次，冷却 {cooldown:.0f} 秒...")
+                time.sleep(cooldown)
+                consecutive_fails = 0
         
-        # 随机延迟，模拟人类浏览节奏
         if i < total:
-            base_wait = delay + random.uniform(0, 2.0)
-            # 偶尔加一个较长的停顿（模拟人在"仔细看"某个商品）
-            if random.random() < 0.15:
-                base_wait += random.uniform(3, 8)
-            wait_time = max(2.0, base_wait)
+            wait_time = human_like_delay(delay)
             print(f"    ⏳ 等待 {wait_time:.1f} 秒...")
             time.sleep(wait_time)
     

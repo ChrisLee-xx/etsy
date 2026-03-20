@@ -49,19 +49,51 @@ def get_chrome_path() -> Optional[str]:
     return None
 
 
-def clean_chrome_profile():
-    """清理 Chrome profile 目录中的 cookies 和缓存，保留基本配置"""
+def clean_chrome_profile(full_clean: bool = False):
+    """
+    清理 Chrome profile：
+    - full_clean=False（默认）: 只清除缓存和追踪数据，保留 cookies/登录状态
+    - full_clean=True: 删除整个 profile 目录
+    """
     import shutil
     profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
     if not profile_dir.exists():
         return
     
-    # 删除整个 profile 目录来彻底清除 cookies/缓存/限制标记
-    try:
-        shutil.rmtree(profile_dir)
-        print("  ✓ 已清理 Chrome profile（cookies/缓存）")
-    except Exception as e:
-        print(f"  ⚠️ 清理 Chrome profile 失败: {e}")
+    if full_clean:
+        try:
+            shutil.rmtree(profile_dir)
+            print("  ✓ 已彻底清理 Chrome profile")
+        except Exception as e:
+            print(f"  ⚠️ 清理 Chrome profile 失败: {e}")
+        return
+    
+    # 选择性清理：删除缓存/追踪/限流标记，保留 cookies 和登录状态
+    targets = [
+        "Default/Cache",
+        "Default/Code Cache",
+        "Default/GPUCache",
+        "Default/Service Worker",
+        "Default/Local Storage/leveldb",
+        "Default/Session Storage",
+        "Default/IndexedDB",
+        "ShaderCache",
+        "GrShaderCache",
+    ]
+    cleaned = 0
+    for target in targets:
+        target_path = profile_dir / target
+        if target_path.exists():
+            try:
+                if target_path.is_dir():
+                    shutil.rmtree(target_path)
+                else:
+                    target_path.unlink()
+                cleaned += 1
+            except Exception:
+                pass
+    if cleaned > 0:
+        print(f"  ✓ 已清理 {cleaned} 项缓存/追踪数据（保留 cookies/登录状态）")
 
 
 def start_chrome_with_debug(url: str, port: int = 9222, clean: bool = False) -> subprocess.Popen:
@@ -84,6 +116,8 @@ def start_chrome_with_debug(url: str, port: int = 9222, clean: bool = False) -> 
     temp_user_dir = Path.home() / ".etsy_scraper_chrome_profile"
     temp_user_dir.mkdir(exist_ok=True)
     
+    width = random.randint(1200, 1920)
+    height = random.randint(800, 1080)
     cmd = [
         chrome_path,
         f"--remote-debugging-port={port}",
@@ -93,7 +127,12 @@ def start_chrome_with_debug(url: str, port: int = 9222, clean: bool = False) -> 
         "--disable-blink-features=AutomationControlled",
         "--disable-infobars",
         "--disable-dev-shm-usage",
-        f"--window-size={random.randint(1200, 1920)},{random.randint(800, 1080)}",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--lang=en-US,en",
+        "--accept-lang=en-US,en;q=0.9",
+        f"--window-size={width},{height}",
         url
     ]
     
@@ -106,21 +145,44 @@ def apply_stealth(driver):
     必须在每次创建 driver 连接后调用。
     """
     try:
-        # 通过 CDP 命令在页面加载前注入脚本，覆盖 navigator.webdriver
         driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                // 伪造 chrome.runtime（正常 Chrome 有，Selenium 没有）
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                    configurable: true
+                });
                 if (!window.chrome) { window.chrome = {}; }
-                if (!window.chrome.runtime) { window.chrome.runtime = {}; }
-                // 伪造 Plugins（无头浏览器通常为空）
+                if (!window.chrome.runtime) {
+                    window.chrome.runtime = {
+                        connect: function() {},
+                        sendMessage: function() {}
+                    };
+                }
                 Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
+                    get: () => [1, 2, 3, 4, 5],
+                    configurable: true
                 });
-                // 伪造 languages
                 Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en', 'zh-CN']
+                    get: () => ['en-US', 'en'],
+                    configurable: true
                 });
+
+                // 伪造 permissions query 行为（DataDome 会检查）
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+
+                // 伪造 WebGL vendor/renderer（反指纹）
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 37445) return 'Intel Inc.';
+                    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                    return getParameter.call(this, parameter);
+                };
+
                 // 移除 Selenium 注入的 cdc_ 变量
                 const cleanCdc = () => {
                     for (const key of Object.keys(document)) {
@@ -130,8 +192,155 @@ def apply_stealth(driver):
                 cleanCdc();
                 const observer = new MutationObserver(cleanCdc);
                 observer.observe(document, {childList: true, subtree: true});
+
+                // 覆盖 toString，防止检测脚本通过 toString 发现函数被重写
+                const nativeToString = Function.prototype.toString;
+                Function.prototype.toString = function() {
+                    if (this === Function.prototype.toString) return 'function toString() { [native code] }';
+                    if (this === navigator.permissions.query) return 'function query() { [native code] }';
+                    return nativeToString.call(this);
+                };
             """
         })
+    except Exception:
+        pass
+
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+]
+
+
+def get_random_ua() -> str:
+    return random.choice(USER_AGENTS)
+
+
+def detect_access_block(driver) -> bool:
+    """
+    检测当前页面是否触发了 Etsy / DataDome 的访问限制。
+    返回 True 表示被限制，False 表示正常。
+    """
+    try:
+        current_url = driver.current_url.lower()
+        if 'captcha' in current_url or 'geo.captcha' in current_url or 'datadome' in current_url:
+            return True
+
+        page_source = driver.page_source
+        if not page_source:
+            return False
+        page_lower = page_source.lower()
+
+        block_indicators = [
+            'datadome',
+            'captcha-container',
+            'captcha-delivery',
+            'blocked your access',
+            'access to this page has been denied',
+            'unusual traffic',
+            'please verify you are a human',
+            'are you a human',
+            'challenge-platform',
+            'cf-challenge',
+            'just a moment',
+            'checking your browser',
+            'verify you are human',
+            # Etsy 中文限制页面特征
+            '访问暂时受限',
+            '我不是机器人',
+            '浏览网页的速度异常',
+            '网路机器人',
+            '非正常操作',
+            '验证程式',
+            # Etsy 英文限制页面
+            'temporarily limited',
+            'rate limited',
+            'too many requests',
+        ]
+        for indicator in block_indicators:
+            if indicator in page_lower:
+                return True
+
+        if 'geo.captcha-delivery.com' in page_lower:
+            return True
+
+        # 检测页面是否几乎为空（只有 Etsy logo + 限制文字，没有产品内容）
+        # 限制页面的 HTML 通常很短（<5000字符），且没有产品相关元素
+        if 'etsy.com' in current_url and len(page_source) < 5000:
+            from selenium.webdriver.common.by import By
+            try:
+                product_elements = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    'h1[data-buy-box-listing-title], div.v2-listing-card, div[data-appears-component-name="listing_page"]'
+                )
+                if not product_elements:
+                    title_el = driver.find_elements(By.TAG_NAME, 'h1')
+                    # 页面很短 + 无产品元素 + 没有正常标题 → 大概率是限制页面
+                    if not title_el or (title_el and len(title_el[0].text) < 3):
+                        return True
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+    return False
+
+
+def wait_for_block_resolution(driver, timeout: int = 300, check_interval: int = 3) -> bool:
+    """
+    CLI 模式：检测到封锁后等待用户手动解除。
+    每 check_interval 秒检查一次页面是否恢复正常。
+    timeout 秒后放弃。返回 True 表示已解除。
+    """
+    print("\n" + "=" * 60)
+    print("⚠️  检测到 Etsy 访问限制！")
+    print("   请在浏览器中手动完成验证（人机验证/CAPTCHA）")
+    print("   验证通过后程序会自动继续")
+    print("=" * 60)
+
+    start = time.time()
+    while time.time() - start < timeout:
+        time.sleep(check_interval)
+        if not detect_access_block(driver):
+            print("✅ 验证通过，继续抓取...")
+            time.sleep(random.uniform(2, 4))
+            return True
+        elapsed = int(time.time() - start)
+        print(f"   等待验证中... ({elapsed}s / {timeout}s)")
+
+    print("❌ 等待超时，验证未通过")
+    return False
+
+
+def human_like_delay(base: float = 2.0):
+    """更拟人化的延迟：对数正态分布 + 偶发长停顿"""
+    import math
+    delay = random.lognormvariate(math.log(base), 0.4)
+    if random.random() < 0.12:
+        delay += random.uniform(5, 15)
+    return min(delay, 30.0)
+
+
+def simulate_mouse_movement(driver):
+    """在页面上模拟随机鼠标移动事件"""
+    try:
+        driver.execute_script("""
+            (function() {
+                const moves = Math.floor(Math.random() * 5) + 3;
+                for (let i = 0; i < moves; i++) {
+                    const x = Math.floor(Math.random() * window.innerWidth);
+                    const y = Math.floor(Math.random() * window.innerHeight);
+                    document.dispatchEvent(new MouseEvent('mousemove', {
+                        clientX: x, clientY: y, bubbles: true
+                    }));
+                }
+            })();
+        """)
     except Exception:
         pass
 
@@ -207,28 +416,47 @@ def extract_data_with_selenium(port: int = 9222) -> Optional[Dict]:
                     pass
         
         if not is_product_page:
-            print("⚠️  未检测到产品页面元素！")
-            print("   可能原因：")
-            print("   1. 还在验证页面")
-            print("   2. 页面未完全加载")
-            print("   3. 不是有效的 Etsy 产品页面")
-            
-            # 询问用户是否要强制继续
-            force = input("\n是否强制继续抓取? (y/N): ")
-            if force.lower() != 'y':
-                return None
-            print("强制继续...")
+            # 先检查是否被封锁
+            if detect_access_block(driver):
+                resolved = wait_for_block_resolution(driver)
+                if resolved:
+                    # 重新检测产品页面
+                    for selector in product_indicators:
+                        try:
+                            el = driver.find_element(By.CSS_SELECTOR, selector)
+                            if el:
+                                is_product_page = True
+                                break
+                        except:
+                            continue
+                if not is_product_page:
+                    return None
+            else:
+                print("⚠️  未检测到产品页面元素！")
+                print("   可能原因：")
+                print("   1. 还在验证页面")
+                print("   2. 页面未完全加载")
+                print("   3. 不是有效的 Etsy 产品页面")
+                
+                force = input("\n是否强制继续抓取? (y/N): ")
+                if force.lower() != 'y':
+                    return None
+                print("强制继续...")
         
-        # 模拟人类滚动
+        # 模拟人类浏览行为
         print("模拟浏览行为...")
-        for _ in range(3):
+        simulate_mouse_movement(driver)
+        for _ in range(random.randint(2, 4)):
             scroll_distance = random.randint(200, 500)
             driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
             time.sleep(random.uniform(0.5, 1.5))
+        if random.random() < 0.3:
+            driver.execute_script(f"window.scrollBy(0, -{random.randint(100, 200)})")
+            time.sleep(random.uniform(0.3, 0.6))
+        simulate_mouse_movement(driver)
         
-        # 滚动回顶部
         driver.execute_script("window.scrollTo(0, 0)")
-        time.sleep(1)
+        time.sleep(random.uniform(0.8, 1.5))
         
         # 提取数据
         print("提取数据...")
@@ -469,27 +697,45 @@ def download_images(images: List[str], title: str, output_dir: Path,
         download_list = [(i+1, url) for i, url in enumerate(images)]
         print(f"\n下载 {len(images)} 张图片...")
     
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Referer": "https://www.etsy.com/"
-    }
-    
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": get_random_ua(),
+        "Referer": "https://www.etsy.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+
     for idx, url in download_list:
-        try:
-            ext = url.split('.')[-1].split('?')[0] or 'jpg'
-            filename = f"{safe_title}-{idx}.{ext}"
-            filepath = output_dir / filename
-            
-            resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 200:
-                filepath.write_bytes(resp.content)
-                print(f"  ✓ [{idx}/{len(images)}] {filename}")
-            else:
-                print(f"  ✗ [{idx}/{len(images)}] HTTP {resp.status_code}")
-        except Exception as e:
-            print(f"  ✗ [{idx}/{len(images)}] {e}")
+        success = False
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    session.headers["User-Agent"] = get_random_ua()
+                    time.sleep(random.uniform(1, 3))
+                
+                resp = session.get(url, timeout=30)
+                if resp.status_code == 200:
+                    ext = url.split('.')[-1].split('?')[0] or 'jpg'
+                    filename = f"{safe_title}-{idx}.{ext}"
+                    filepath = output_dir / filename
+                    filepath.write_bytes(resp.content)
+                    print(f"  ✓ [{idx}/{len(images)}] {filename}")
+                    success = True
+                    break
+                elif resp.status_code == 429:
+                    print(f"  ⏳ [{idx}] 被限速，等待后重试...")
+                    time.sleep(random.uniform(5, 10))
+                else:
+                    print(f"  ✗ [{idx}/{len(images)}] HTTP {resp.status_code}")
+                    break
+            except Exception as e:
+                if attempt < 2:
+                    continue
+                print(f"  ✗ [{idx}/{len(images)}] {e}")
         
         time.sleep(random.uniform(0.3, 0.8))
+    
+    session.close()
 
 
 def main():
@@ -627,14 +873,21 @@ def main():
             print(f"  {url}")
             print(f"{'='*60}")
         
-        # 如果不是第一个链接，需要导航到新页面
         if idx > 1:
             try:
                 driver.get(url)
-                # 等待页面加载
-                time.sleep(2)
-                # 模拟人类滚动
-                for _ in range(2):
+                time.sleep(random.uniform(2, 4))
+                # 导航后检测封锁
+                if detect_access_block(driver):
+                    resolved = wait_for_block_resolution(driver)
+                    if not resolved:
+                        print("  ❌ 验证未通过，跳过此链接")
+                        fail_count += 1
+                        continue
+                    driver.get(url)
+                    time.sleep(random.uniform(2, 4))
+                simulate_mouse_movement(driver)
+                for _ in range(random.randint(2, 3)):
                     scroll_distance = random.randint(200, 400)
                     driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
                     time.sleep(random.uniform(0.3, 0.8))
@@ -648,11 +901,21 @@ def main():
         result = extract_data_with_selenium(args.port)
         
         if not result or not result.get('title'):
-            print(f"\n❌ 抓取失败！")
-            fail_count += 1
-            if idx < total_urls:
-                print("  继续处理下一个链接...")
-            continue
+            # 检查是否被封锁导致失败
+            if detect_access_block(driver):
+                print("  ⚠️ 检测到访问限制！")
+                resolved = wait_for_block_resolution(driver)
+                if resolved:
+                    driver.get(url)
+                    time.sleep(random.uniform(2, 4))
+                    result = extract_data_with_selenium(args.port)
+            
+            if not result or not result.get('title'):
+                print(f"\n❌ 抓取失败！")
+                fail_count += 1
+                if idx < total_urls:
+                    print("  继续处理下一个链接...")
+                continue
         
         success_count += 1
         
@@ -674,10 +937,8 @@ def main():
         download_images(result.get('images', []), result.get('title', ''), output_path,
                         image_selection=image_selection, filter_words=filter_words)
         
-        # 多链接间延迟
         if idx < total_urls:
-            wait_time = args.delay + random.uniform(-0.5, 1.0)
-            wait_time = max(1.0, wait_time)
+            wait_time = human_like_delay(args.delay)
             print(f"\n⏳ 等待 {wait_time:.1f} 秒后处理下一个链接...")
             time.sleep(wait_time)
     
