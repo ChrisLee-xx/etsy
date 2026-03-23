@@ -619,7 +619,7 @@ def _is_access_blocked(driver) -> bool:
     """检测当前页面是否触发了 Etsy 的「访问暂时受限」"""
     try:
         page_source = driver.page_source
-        if '访问暂时受限' in page_source:
+        if '访问暂时受限' in page_source or 'Access is temporarily restricted' in page_source:
             return True
     except Exception:
         pass
