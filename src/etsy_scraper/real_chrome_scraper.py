@@ -88,18 +88,33 @@ def wait_for_chrome_ready(port: int = 9222, timeout: int = 30) -> bool:
     return False
 
 
-def extract_data_with_selenium(port: int = 9222) -> Optional[Dict]:
-    """使用 Selenium 连接并提取数据"""
+def create_patched_driver(port: int = 9222):
+    """
+    创建经过 patch 的 ChromeDriver 连接。
+    用 undetected_chromedriver 的 Patcher 移除 chromedriver 二进制中的 cdc_ 指纹，
+    再用标准 Selenium 连接到已有的 Chrome 实例。
+    """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    import undetected_chromedriver as uc
+
+    patcher = uc.Patcher()
+    patcher.auto()
+
+    options = Options()
+    options.add_experimental_option("debuggerAddress", f"localhost:{port}")
+    service = Service(executable_path=patcher.executable_path)
+    return webdriver.Chrome(service=service, options=options)
+
+
+def extract_data_with_selenium(port: int = 9222) -> Optional[Dict]:
+    """使用 Selenium 连接并提取数据"""
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"localhost:{port}")
-    
-    driver = webdriver.Chrome(options=options)
+    driver = create_patched_driver(port)
     
     try:
         # 获取当前 URL
@@ -540,13 +555,7 @@ def main():
     
     input("\n✋ 验证完成、页面加载好后，按 Enter 继续...")
     
-    # 连接 Selenium
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"localhost:{args.port}")
-    driver = webdriver.Chrome(options=options)
+    driver = create_patched_driver(args.port)
     
     # 步骤 3：处理所有链接
     print("\n📌 步骤 3: 提取数据")

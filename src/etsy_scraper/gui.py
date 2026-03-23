@@ -30,7 +30,8 @@ try:
         sanitize_folder_name
     )
     from .real_chrome_scraper import (
-        extract_data_with_selenium, download_images, sanitize_filename
+        extract_data_with_selenium, download_images, sanitize_filename,
+        create_patched_driver,
     )
     from .utils import parse_image_selection, parse_filter_words
 except ImportError:
@@ -41,7 +42,8 @@ except ImportError:
         sanitize_folder_name
     )
     from real_chrome_scraper import (
-        extract_data_with_selenium, download_images, sanitize_filename
+        extract_data_with_selenium, download_images, sanitize_filename,
+        create_patched_driver,
     )
     from utils import parse_image_selection, parse_filter_words
 
@@ -182,12 +184,7 @@ class ScraperWorker:
             self.log("")
             self.log("✅ 开始抓取...")
             
-            from selenium import webdriver
-            from selenium.webdriver.chrome.options import Options
-            
-            options = Options()
-            options.add_experimental_option("debuggerAddress", f"localhost:{self.port}")
-            self.driver = webdriver.Chrome(options=options)
+            self.driver = create_patched_driver(self.port)
             
             if self.mode == 'product':
                 self._scrape_products()

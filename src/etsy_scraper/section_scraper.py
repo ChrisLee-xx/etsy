@@ -161,6 +161,7 @@ try:
         start_chrome_with_debug,
         wait_for_chrome_ready,
         extract_data_with_selenium,
+        create_patched_driver,
     )
 except ImportError:
     from real_chrome_scraper import (
@@ -169,6 +170,7 @@ except ImportError:
         start_chrome_with_debug,
         wait_for_chrome_ready,
         extract_data_with_selenium,
+        create_patched_driver,
     )
 
 
@@ -613,6 +615,52 @@ def download_images_to_section(
     return downloaded
 
 
+def _is_access_blocked(driver) -> bool:
+    """检测当前页面是否触发了 Etsy 的访问限制"""
+    try:
+        page_source = driver.page_source.lower()
+        blocked_signals = [
+            'captcha', 'robot', '机器人', 'access denied',
+            'temporarily restricted', '暂时受限', '访问受限',
+            'geo.captcha-delivery.com', 'datadome',
+        ]
+        for signal in blocked_signals:
+            if signal in page_source:
+                return True
+        current_url = driver.current_url.lower()
+        if 'captcha' in current_url or 'datadome' in current_url:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _wait_for_access_recovery(driver, product_url: str, max_retries: int = 30) -> bool:
+    """
+    检测到访问限制后，定期刷新页面等待恢复。
+
+    每 5~10 分钟刷新一次，恢复后自动继续。
+    Returns: True=已恢复, False=超过最大重试次数仍未恢复
+    """
+    for attempt in range(1, max_retries + 1):
+        wait_minutes = random.uniform(5, 10)
+        print(f"    🚫 检测到访问限制，第 {attempt} 次等待 {wait_minutes:.1f} 分钟后重试...")
+        time.sleep(wait_minutes * 60)
+
+        try:
+            driver.get(product_url)
+            time.sleep(random.uniform(3, 5))
+        except Exception:
+            continue
+
+        if not _is_access_blocked(driver):
+            print(f"    ✅ 访问已恢复！继续抓取...")
+            return True
+
+    print(f"    ❌ 等待 {max_retries} 次仍未恢复")
+    return False
+
+
 def process_product(driver, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
                     image_selection: List[int] = None, filter_words: List[str] = None) -> bool:
     """
@@ -634,10 +682,13 @@ def process_product(driver, listing_id: str, output_dir: Path, name_tracker: Ima
     try:
         # 导航到商品页面
         driver.get(product_url)
-        time.sleep(random.uniform(2, 4))  # 随机延迟
+        time.sleep(random.uniform(2, 4))
         
-        # 使用 real_chrome_scraper 的数据提取函数
-        # 但我们需要跳过验证检测（因为已经在 Section 页面验证过了）
+        # 兜底：检测访问限制，等待恢复后重试
+        if _is_access_blocked(driver):
+            if not _wait_for_access_recovery(driver, product_url):
+                return False
+        
         data = extract_product_data_silent(driver)
         
         if not data or not data.get('title'):
@@ -986,13 +1037,7 @@ def main():
     
     input("\n✋ 验证完成、页面加载好后，按 Enter 继续...")
     
-    # 连接到 Chrome
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"localhost:{args.port}")
-    driver = webdriver.Chrome(options=options)
+    driver = create_patched_driver(args.port)
     
     # 统计
     total_success = 0
