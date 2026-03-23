@@ -20,12 +20,12 @@ from typing import Optional, Dict, List
 import requests
 
 
-def sanitize_filename(name: str, max_length: int = 100) -> str:
+def sanitize_filename(name: str) -> str:
     """清理文件名"""
     if not name:
         return "unnamed"
     sanitized = re.sub(r'[<>:"/\\|?*\n\r\t]', '_', name)
-    return sanitized[:max_length].rstrip(' ._') or "unnamed"
+    return sanitized.rstrip(' ._') or "unnamed"
 
 
 def get_chrome_path() -> Optional[str]:
