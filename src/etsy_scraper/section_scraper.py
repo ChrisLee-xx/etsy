@@ -616,19 +616,10 @@ def download_images_to_section(
 
 
 def _is_access_blocked(driver) -> bool:
-    """检测当前页面是否触发了 Etsy 的访问限制"""
+    """检测当前页面是否触发了 Etsy 的「访问暂时受限」"""
     try:
-        page_source = driver.page_source.lower()
-        blocked_signals = [
-            'captcha', 'robot', '机器人', 'access denied',
-            'temporarily restricted', '暂时受限', '访问受限',
-            'geo.captcha-delivery.com', 'datadome',
-        ]
-        for signal in blocked_signals:
-            if signal in page_source:
-                return True
-        current_url = driver.current_url.lower()
-        if 'captcha' in current_url or 'datadome' in current_url:
+        page_source = driver.page_source
+        if '访问暂时受限' in page_source:
             return True
     except Exception:
         pass
