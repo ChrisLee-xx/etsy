@@ -108,6 +108,84 @@ def create_patched_driver(port: int = 9222):
     return webdriver.Chrome(service=service, options=options)
 
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+]
+
+
+def get_random_ua() -> str:
+    return random.choice(USER_AGENTS)
+
+
+def detect_access_block(driver) -> bool:
+    """
+    检测当前页面是否触发了 Etsy / DataDome 的访问限制。
+    返回 True 表示被限制，False 表示正常。
+    """
+    try:
+        current_url = driver.current_url.lower()
+        if 'captcha' in current_url or 'datadome' in current_url:
+            return True
+
+        page_source = driver.page_source.lower()
+        blocked_signals = [
+            'captcha', 'robot', '机器人', 'access denied',
+            'temporarily restricted', '暂时受限', '访问受限',
+            'geo.captcha-delivery.com', 'datadome',
+        ]
+        for signal in blocked_signals:
+            if signal in page_source:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def wait_for_block_resolution(driver, timeout: int = 300, check_interval: int = 3) -> bool:
+    """
+    等待用户手动完成验证（验证码等），最多等 timeout 秒。
+    返回 True 表示验证通过，False 表示超时。
+    """
+    print("    ⚠️ 检测到访问限制，请在浏览器中手动完成验证...")
+    elapsed = 0
+    while elapsed < timeout:
+        time.sleep(check_interval)
+        elapsed += check_interval
+        if not detect_access_block(driver):
+            print("    ✅ 验证通过！")
+            return True
+    print(f"    ❌ 等待 {timeout} 秒后仍未通过验证")
+    return False
+
+
+def human_like_delay(base: float = 2.0) -> float:
+    """生成人类行为风格的随机延迟"""
+    delay = base + random.uniform(-0.5, 1.5)
+    if random.random() < 0.1:
+        delay += random.uniform(2, 5)
+    return max(1.0, delay)
+
+
+def simulate_mouse_movement(driver):
+    """模拟鼠标移动，增加人类行为特征"""
+    try:
+        driver.execute_script("""
+            var event = new MouseEvent('mousemove', {
+                clientX: Math.random() * window.innerWidth,
+                clientY: Math.random() * window.innerHeight
+            });
+            document.dispatchEvent(event);
+        """)
+    except Exception:
+        pass
+
+
 def extract_data_with_selenium(port: int = 9222) -> Optional[Dict]:
     """使用 Selenium 连接并提取数据"""
     from selenium.webdriver.common.by import By
