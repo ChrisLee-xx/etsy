@@ -626,73 +626,126 @@ def _is_access_blocked(driver) -> bool:
     return False
 
 
-def _wait_for_access_recovery(driver, product_url: str, max_retries: int = 30) -> bool:
+def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
     """
-    检测到访问限制后，定期刷新页面等待恢复。
-
-    每 5~10 分钟刷新一次，恢复后自动继续。
-    Returns: True=已恢复, False=超过最大重试次数仍未恢复
+    清理 profile 并重启 Chrome，返回 (new_chrome_process, new_driver)。
+    用于被封锁后自动恢复。
     """
-    for attempt in range(1, max_retries + 1):
-        wait_minutes = random.uniform(5, 10)
-        print(f"    🚫 检测到访问限制，第 {attempt} 次等待 {wait_minutes:.1f} 分钟后重试...")
-        time.sleep(wait_minutes * 60)
+    import shutil
 
+    print("\n    🔄 自动重启 Chrome（清理旧 session）...")
+
+    # 关闭旧 Chrome
+    if chrome_process:
         try:
-            driver.get(product_url)
-            time.sleep(random.uniform(3, 5))
+            chrome_process.terminate()
+            chrome_process.wait(timeout=5)
         except Exception:
-            continue
+            try:
+                chrome_process.kill()
+            except Exception:
+                pass
+    time.sleep(2)
 
-        if not _is_access_blocked(driver):
-            print(f"    ✅ 访问已恢复！继续抓取...")
-            return True
+    # 删除 profile（清掉被标记的 cookies/session）
+    profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
+    if profile_dir.exists():
+        try:
+            shutil.rmtree(profile_dir)
+            print("    ✓ 已清理旧 profile")
+        except Exception:
+            pass
 
-    print(f"    ❌ 等待 {max_retries} 次仍未恢复")
-    return False
+    # 重启
+    new_chrome = start_chrome_with_debug(url, port)
+    if not wait_for_chrome_ready(port):
+        print("    ❌ Chrome 重启失败")
+        return None, None
+
+    new_driver = create_patched_driver(port)
+    print("    ✅ Chrome 已重启，全新 session")
+    return new_chrome, new_driver
 
 
-def process_product(driver, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
+class _DriverContext:
+    """在抓取循环中共享可替换的 driver 和 chrome_process"""
+    def __init__(self, driver, chrome_process, port: int = 9222):
+        self.driver = driver
+        self.chrome_process = chrome_process
+        self.port = port
+
+    def handle_block(self, url: str) -> bool:
+        """
+        检测到封锁后自动重启 Chrome。
+        等 30 秒冷却后重启，然后导航到目标 URL 验证是否恢复。
+        最多尝试 3 次。
+        """
+        for attempt in range(1, 4):
+            cooldown = 30 * attempt
+            print(f"    🚫 访问被限制，等待 {cooldown} 秒后重启 Chrome（第 {attempt} 次）...")
+            time.sleep(cooldown)
+
+            new_chrome, new_driver = _restart_chrome_fresh(
+                self.chrome_process, url, self.port
+            )
+            if not new_driver:
+                continue
+
+            self.chrome_process = new_chrome
+            self.driver = new_driver
+
+            try:
+                self.driver.get(url)
+                time.sleep(random.uniform(3, 5))
+            except Exception:
+                continue
+
+            if not _is_access_blocked(self.driver):
+                return True
+
+        print("    ❌ 多次重启仍被限制")
+        return False
+
+
+def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
                     image_selection: List[int] = None, filter_words: List[str] = None) -> bool:
     """
     处理单个商品：导航、提取数据、下载图片
-    
+
     Args:
-        driver: Selenium WebDriver 实例
+        ctx: _DriverContext（包含 driver 和 chrome_process，封锁时可自动重启）
         listing_id: 商品 ID
         output_dir: 输出目录
         name_tracker: 文件名跟踪器
         image_selection: 要下载的图片序号列表
         filter_words: 标题过滤词列表
-        
+
     Returns:
         是否成功处理
     """
     product_url = f"https://www.etsy.com/listing/{listing_id}"
-    
+
     try:
-        # 导航到商品页面
-        driver.get(product_url)
+        ctx.driver.get(product_url)
         time.sleep(random.uniform(2, 4))
-        
-        # 兜底：检测访问限制，等待恢复后重试
-        if _is_access_blocked(driver):
-            if not _wait_for_access_recovery(driver, product_url):
+
+        # 兜底：检测访问限制 → 自动清 profile 重启 Chrome
+        if _is_access_blocked(ctx.driver):
+            if not ctx.handle_block(product_url):
                 return False
-        
-        data = extract_product_data_silent(driver)
-        
+
+        data = extract_product_data_silent(ctx.driver)
+
         if not data or not data.get('title'):
             print(f"    ⚠️ 无法提取商品数据")
             return False
-        
-        # 下载图片
+
         images = data.get('images', [])
         if images:
             downloaded = download_images_to_section(
-                images, 
-                data['title'], 
-                output_dir, 
+                images,
+                data['title'],
+                output_dir,
                 name_tracker,
                 image_selection=image_selection,
                 filter_words=filter_words
@@ -703,7 +756,7 @@ def process_product(driver, listing_id: str, output_dir: Path, name_tracker: Ima
         else:
             print(f"    ⚠️ 没有找到图片")
             return False
-            
+
     except Exception as e:
         print(f"    ✗ 处理失败: {e}")
         return False
@@ -800,7 +853,7 @@ def extract_product_data_silent(driver) -> Optional[Dict]:
 
 
 def process_all_products(
-    driver, 
+    ctx,
     listing_ids: List[str], 
     output_dir: Path,
     delay: float = 2.0,
@@ -812,7 +865,7 @@ def process_all_products(
     批量处理所有商品
     
     Args:
-        driver: Selenium WebDriver 实例
+        ctx: _DriverContext（封锁时可自动重启 Chrome）
         listing_ids: 商品 ID 列表
         output_dir: 输出目录
         delay: 商品间延迟（秒）
@@ -839,10 +892,9 @@ def process_all_products(
     for i, listing_id in enumerate(listing_ids, 1):
         print(f"\n[{i}/{total}] 商品 ID: {listing_id}")
         
-        if process_product(driver, listing_id, output_dir, name_tracker,
+        if process_product(ctx, listing_id, output_dir, name_tracker,
                           image_selection=image_selection, filter_words=filter_words):
             success_count += 1
-            # 成功后立即保存进度
             if progress:
                 progress.save(listing_id)
         else:
@@ -1029,6 +1081,7 @@ def main():
     input("\n✋ 验证完成、页面加载好后，按 Enter 继续...")
     
     driver = create_patched_driver(args.port)
+    ctx = _DriverContext(driver, chrome_process, args.port)
     
     # 统计
     total_success = 0
@@ -1051,14 +1104,13 @@ def main():
             # 如果不是第一个 Section，需要导航到新页面
             if sec_idx > 1:
                 try:
-                    driver.get(url)
+                    ctx.driver.get(url)
                     time.sleep(2)
-                    # 等待页面加载
                     for _ in range(2):
                         scroll_distance = random.randint(200, 400)
-                        driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
+                        ctx.driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
                         time.sleep(random.uniform(0.3, 0.8))
-                    driver.execute_script("window.scrollTo(0, 0)")
+                    ctx.driver.execute_script("window.scrollTo(0, 0)")
                     time.sleep(1)
                 except Exception as e:
                     print(f"  ❌ 导航失败: {e}")
@@ -1066,7 +1118,7 @@ def main():
             
             # 获取 Section 信息（在创建输出目录之前获取 section 名称）
             print(f"\n  📌 获取 Section 信息...")
-            section_name, total_items = get_section_info(driver, section_id)
+            section_name, total_items = get_section_info(ctx.driver, section_id)
             print(f"    Section: {section_name}")
             print(f"    预计商品数: {total_items}")
             
@@ -1111,7 +1163,7 @@ def main():
             print(f"\n  📌 提取商品链接...")
             
             # 提取所有商品链接（传入 total_items 用于计算翻页）
-            listing_ids = extract_product_links(driver, url, total_items=total_items)
+            listing_ids = extract_product_links(ctx.driver, url, total_items=total_items)
             
             if not listing_ids:
                 print(f"\n  ❌ 没有找到任何商品！")
@@ -1150,7 +1202,7 @@ def main():
             print(f"\n  📌 下载商品图片 ({len(pending_ids)} 个)...")
             
             success, fail = process_all_products(
-                driver, 
+                ctx, 
                 pending_ids, 
                 output_path,
                 delay=args.delay,
@@ -1190,10 +1242,12 @@ def main():
         print(f"  输出目录: {args.output}")
         
     finally:
-        # 询问是否关闭浏览器
         close = input("\n是否关闭 Chrome 浏览器? (y/N): ")
         if close.lower() == 'y':
-            chrome_process.terminate()
+            try:
+                ctx.chrome_process.terminate()
+            except Exception:
+                pass
             print("浏览器已关闭")
         else:
             print("浏览器保持打开")

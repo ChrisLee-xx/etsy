@@ -27,7 +27,7 @@ try:
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
         start_chrome_with_debug, wait_for_chrome_ready,
-        sanitize_folder_name
+        sanitize_folder_name, _DriverContext, _is_access_blocked,
     )
     from .real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
@@ -39,7 +39,7 @@ except ImportError:
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
         start_chrome_with_debug, wait_for_chrome_ready,
-        sanitize_folder_name
+        sanitize_folder_name, _DriverContext, _is_access_blocked,
     )
     from real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
@@ -185,6 +185,18 @@ class ScraperWorker:
             self.log("✅ 开始抓取...")
             
             self.driver = create_patched_driver(self.port)
+            self.ctx = _DriverContext(self.driver, self.chrome_process, self.port)
+            
+            # 开始前检测封锁，自动重启恢复
+            if _is_access_blocked(self.driver):
+                self.log("🚫 检测到访问限制，自动重启 Chrome...")
+                if self.ctx.handle_block(self.urls[0]):
+                    self.driver = self.ctx.driver
+                    self.chrome_process = self.ctx.chrome_process
+                    self.log("✅ 已恢复，继续抓取")
+                else:
+                    self.app.after(0, lambda: self.app.on_finished(False, "访问被限制，多次重启仍无法恢复"))
+                    return
             
             if self.mode == 'product':
                 self._scrape_products()
@@ -194,9 +206,10 @@ class ScraperWorker:
         except Exception as e:
             self.app.after(0, lambda: self.app.on_finished(False, f"错误: {str(e)}"))
         finally:
-            if self.chrome_process:
+            cp = getattr(self, 'ctx', None) and self.ctx.chrome_process or self.chrome_process
+            if cp:
                 try:
-                    self.chrome_process.terminate()
+                    cp.terminate()
                 except:
                     pass
     
@@ -331,13 +344,16 @@ class ScraperWorker:
                 
                 self.update_progress(i, len(pending_ids))
                 
-                if process_product(self.driver, listing_id, output_path, name_tracker,
+                if process_product(self.ctx, listing_id, output_path, name_tracker,
                                   image_selection=self.image_selection,
                                   filter_words=self.filter_words):
                     total_success += 1
                     progress.save(listing_id)
                 else:
                     total_fail += 1
+                # driver 可能在封锁恢复后被替换，同步引用
+                self.driver = self.ctx.driver
+                self.chrome_process = self.ctx.chrome_process
                 
                 if i < len(pending_ids):
                     time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
