@@ -292,38 +292,60 @@ def extract_data_with_selenium(port: int = 9222) -> Optional[Dict]:
             data['price'] = None
         
         # 图片 - 只获取商品详情主图，排除 "More from this shop" 等杂图
+        # 先滚动到图片区域，触发懒加载
+        try:
+            driver.execute_script("window.scrollTo(0, document.querySelector('.carousel-pane-list')?.offsetTop || 300);")
+            time.sleep(1)
+        except:
+            pass
+
         images = []
         seen_ids = set()  # 使用图片ID去重，而不是URL
-        
+
         def extract_image_id(url):
             """从 URL 中提取图片唯一 ID，如 7261901436"""
             # 匹配 il_xxxxx.数字ID_后缀.jpg 格式
             match = re.search(r'/il_[^.]+\.(\d+)_', url)
             return match.group(1) if match else None
-        
+
         def convert_to_fullsize(url):
             """将任何尺寸的图片 URL 转换为全尺寸"""
             # 匹配各种尺寸格式: _794xN, _570xN, _1588xN, _fullxfull, _300x300 等
             return re.sub(r'il_[^.]+\.', 'il_fullxfull.', url)
-        
+
         # 方法0（最优先）: 直接从 data-src-zoom-image 属性获取最高清图片
         # 这个属性直接包含 fullxfull 版本的 URL，无需转换
-        try:
-            zoom_imgs = driver.find_elements(
-                By.CSS_SELECTOR, 
-                'li[data-carousel-pane]:not([data-video-pane]) img[data-src-zoom-image]'
-            )
-            for img in zoom_imgs:
-                zoom_url = img.get_attribute('data-src-zoom-image')
-                if zoom_url and 'etsystatic.com' in zoom_url:
-                    img_id = extract_image_id(zoom_url)
-                    if img_id and img_id not in seen_ids:
-                        seen_ids.add(img_id)
-                        images.append(zoom_url)
-            if images:
-                print(f"  ✓ 从 data-src-zoom-image 直接获取 {len(images)} 张高清主图")
-        except Exception as e:
-            print(f"  方法0失败: {e}")
+        # 多次尝试，因为懒加载可能需要时间
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                # 尝试等待图片元素加载
+                zoom_imgs = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    'li[data-carousel-pane]:not([data-video-pane]) img[data-src-zoom-image]'
+                )
+                temp_images = []
+                for img in zoom_imgs:
+                    zoom_url = img.get_attribute('data-src-zoom-image')
+                    if zoom_url and 'etsystatic.com' in zoom_url and 'il_fullxfull' in zoom_url:
+                        img_id = extract_image_id(zoom_url)
+                        if img_id and img_id not in seen_ids:
+                            seen_ids.add(img_id)
+                            temp_images.append(zoom_url)
+
+                if temp_images:
+                    images = temp_images
+                    print(f"  ✓ 从 data-src-zoom-image 直接获取 {len(images)} 张高清主图")
+                    break
+                elif attempt < max_attempts - 1:
+                    print(f"  ⏳ 第 {attempt+1} 次未获取到 data-src-zoom-image，重试...")
+                    time.sleep(1)
+                    driver.execute_script("window.scrollBy(0, 100);")
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    time.sleep(1)
+                else:
+                    print(f"  方法0失败: {e}")
         
         # 方法1: 从产品图片轮播/画廊区域获取（备选）
         if not images:
