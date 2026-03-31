@@ -90,16 +90,20 @@ def wait_for_chrome_ready(port: int = 9222, timeout: int = 30) -> bool:
 
 def create_patched_driver(port: int = 9222):
     """
-    创建 ChromeDriver 连接。
-    连接到已运行的 Chrome 实例（通过调试端口）。
-    不使用 undetected_chromedriver，避免版本不匹配问题。
+    使用 undetected_chromedriver 启动带反检测的 Chrome。
+    自动下载匹配版本的 chromedriver 并应用 stealth 补丁。
     """
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
+    import undetected_chromedriver as uc
 
-    options = Options()
-    options.add_experimental_option("debuggerAddress", f"localhost:{port}")
-    return webdriver.Chrome(options=options)
+    options = uc.ChromeOptions()
+    options.add_argument(f"--remote-debugging-port={port}")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+
+    driver = uc.Chrome(options=options, version_main=None, use_subprocess=True)
+    return driver
 
 
 USER_AGENTS = [
