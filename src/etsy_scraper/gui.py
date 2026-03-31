@@ -337,6 +337,7 @@ class ScraperWorker:
                 continue
             
             name_tracker = ImageNameTracker()
+            consecutive_fails = 0
             
             for i, listing_id in enumerate(pending_ids, 1):
                 if self._stop_flag:
@@ -348,9 +349,22 @@ class ScraperWorker:
                                   image_selection=self.image_selection,
                                   filter_words=self.filter_words):
                     total_success += 1
+                    consecutive_fails = 0
                     progress.save(listing_id)
                 else:
                     total_fail += 1
+                    consecutive_fails += 1
+                    
+                    if consecutive_fails >= 3:
+                        product_url = f"https://www.etsy.com/listing/{listing_id}"
+                        self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁，自动重启 Chrome...")
+                        if self.ctx.handle_block(product_url):
+                            self.log("✅ 已恢复，继续抓取")
+                            consecutive_fails = 0
+                        else:
+                            self.log("❌ 无法恢复，停止当前 Section")
+                            break
+
                 # driver 可能在封锁恢复后被替换，同步引用
                 self.driver = self.ctx.driver
                 self.chrome_process = self.ctx.chrome_process

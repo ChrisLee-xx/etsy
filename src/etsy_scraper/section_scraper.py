@@ -616,10 +616,16 @@ def download_images_to_section(
 
 
 def _is_access_blocked(driver) -> bool:
-    """检测当前页面是否触发了 Etsy 的「访问暂时受限」"""
+    """检测当前页面是否触发了 Etsy 的访问限制"""
     try:
+        url = driver.current_url.lower()
+        if 'captcha' in url or 'datadome' in url or 'geo.captcha-delivery' in url:
+            return True
+        title = driver.title.lower()
+        if 'robot' in title or 'captcha' in title or 'restricted' in title:
+            return True
         page_source = driver.page_source
-        if '访问暂时受限' in page_source or 'Access is temporarily restricted' in page_source:
+        if '访问暂时受限' in page_source or 'temporarily restricted' in page_source.lower():
             return True
     except Exception:
         pass
@@ -879,6 +885,8 @@ def process_all_products(
     total = len(listing_ids)
     success_count = 0
     fail_count = 0
+    consecutive_fails = 0
+    max_consecutive_fails = 3
     name_tracker = ImageNameTracker()
     
     print(f"\n{'='*60}")
@@ -895,15 +903,27 @@ def process_all_products(
         if process_product(ctx, listing_id, output_dir, name_tracker,
                           image_selection=image_selection, filter_words=filter_words):
             success_count += 1
+            consecutive_fails = 0
             if progress:
                 progress.save(listing_id)
         else:
             fail_count += 1
+            consecutive_fails += 1
+            
+            # 连续失败达到阈值，很可能是被封了
+            if consecutive_fails >= max_consecutive_fails:
+                product_url = f"https://www.etsy.com/listing/{listing_id}"
+                print(f"\n    ⚠️ 连续 {consecutive_fails} 个商品失败，疑似被封锁，尝试重启 Chrome...")
+                if ctx.handle_block(product_url):
+                    print(f"    ✅ 已恢复，继续抓取")
+                    consecutive_fails = 0
+                else:
+                    print(f"    ❌ 无法恢复，停止抓取")
+                    break
         
-        # 随机延迟，避免被封
         if i < total:
             wait_time = delay + random.uniform(-0.5, 1.0)
-            wait_time = max(1.0, wait_time)  # 至少等待 1 秒
+            wait_time = max(1.0, wait_time)
             print(f"    ⏳ 等待 {wait_time:.1f} 秒...")
             time.sleep(wait_time)
     
