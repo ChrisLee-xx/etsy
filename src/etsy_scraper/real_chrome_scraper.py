@@ -90,22 +90,16 @@ def wait_for_chrome_ready(port: int = 9222, timeout: int = 30) -> bool:
 
 def create_patched_driver(port: int = 9222):
     """
-    创建经过 patch 的 ChromeDriver 连接。
-    用 undetected_chromedriver 的 Patcher 移除 chromedriver 二进制中的 cdc_ 指纹，
-    再用标准 Selenium 连接到已有的 Chrome 实例。
+    创建 ChromeDriver 连接。
+    连接到已运行的 Chrome 实例（通过调试端口）。
+    不使用 undetected_chromedriver，避免版本不匹配问题。
     """
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    import undetected_chromedriver as uc
-
-    patcher = uc.Patcher()
-    patcher.auto()
 
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
-    service = Service(executable_path=patcher.executable_path)
-    return webdriver.Chrome(service=service, options=options)
+    return webdriver.Chrome(options=options)
 
 
 USER_AGENTS = [
