@@ -30,10 +30,21 @@ jobs:
           python-version: '3.11'
 
       - name: Install Poetry
-        run: pip install poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-in-project: true
+
+      - name: Load cached venv
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-3.11-${{ hashFiles('poetry.lock') }}
 
       - name: Install dependencies
-        run: poetry install
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: poetry install --no-interaction --no-root
 
       - name: Build with PyInstaller
         run: poetry run python build.py
