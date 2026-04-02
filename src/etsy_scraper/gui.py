@@ -26,24 +26,24 @@ try:
     from .section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
-        start_chrome_with_debug, wait_for_chrome_ready,
-        sanitize_folder_name, _DriverContext, _is_access_blocked,
+        sanitize_folder_name,
     )
     from .real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
-        create_patched_driver,
+        create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
+        _DriverContext, _is_access_blocked, get_random_ua,
     )
     from .utils import parse_image_selection, parse_filter_words
 except ImportError:
     from section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
-        start_chrome_with_debug, wait_for_chrome_ready,
-        sanitize_folder_name, _DriverContext, _is_access_blocked,
+        sanitize_folder_name,
     )
     from real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
-        create_patched_driver,
+        create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
+        _DriverContext, _is_access_blocked, get_random_ua,
     )
     from utils import parse_image_selection, parse_filter_words
 
@@ -136,7 +136,7 @@ class ScraperWorker:
         self.chrome_process = None
         self.driver = None
         self._stop_flag = False
-        self._user_confirmed = False
+        
         self._thread = None
     
     def log(self, msg: str):
@@ -148,8 +148,6 @@ class ScraperWorker:
     def stop(self):
         self._stop_flag = True
     
-    def user_confirm(self):
-        self._user_confirmed = True
     
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -166,22 +164,7 @@ class ScraperWorker:
                 return
             
             self.log("✅ Chrome 已启动！")
-            self.log("")
-            self.log("━" * 45)
-            self.log("⚠️  请在浏览器中完成验证")
-            self.log("    然后点击「继续抓取」按钮")
-            self.log("━" * 45)
-            
-            self.app.after(0, self.app.on_chrome_ready)
-            
-            while not self._user_confirmed and not self._stop_flag:
-                time.sleep(0.5)
-            
-            if self._stop_flag:
-                self.app.after(0, lambda: self.app.on_finished(False, "用户取消"))
-                return
-            
-            self.log("")
+            time.sleep(3)
             self.log("✅ 开始抓取...")
             
             self.driver = create_patched_driver(self.port)
@@ -206,57 +189,85 @@ class ScraperWorker:
         except Exception as e:
             self.app.after(0, lambda: self.app.on_finished(False, f"错误: {str(e)}"))
         finally:
-            cp = getattr(self, 'ctx', None) and self.ctx.chrome_process or self.chrome_process
-            if cp:
-                try:
-                    cp.terminate()
-                except:
-                    pass
+            try:
+                if hasattr(self, 'ctx') and self.ctx and self.ctx.chrome_process:
+                    self.ctx.chrome_process.terminate()
+                elif self.chrome_process:
+                    self.chrome_process.terminate()
+            except Exception:
+                pass
     
     def _scrape_products(self):
         total = len(self.urls)
         success_count = 0
         fail_count = 0
+        consecutive_fails = 0
         output_path = Path(self.output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        
+
         for idx, url in enumerate(self.urls, 1):
             if self._stop_flag:
                 break
-            
+
             self.log(f"\n[{idx}/{total}] 处理商品...")
             self.update_progress(idx, total)
-            
+
             if idx > 1:
                 try:
-                    self.driver.get(url)
+                    self.ctx.driver.get(url)
                     time.sleep(2)
                 except Exception as e:
                     self.log(f"  ❌ 导航失败: {e}")
                     fail_count += 1
+                    consecutive_fails += 1
                     continue
-            
-            result = extract_data_with_selenium(self.port)
-            
+
+            # 封锁检测
+            if _is_access_blocked(self.ctx.driver):
+                self.log("🚫 检测到访问限制，自动重启 Chrome...")
+                if self.ctx.handle_block(url):
+                    self.log("✅ 已恢复")
+                    consecutive_fails = 0
+                else:
+                    self.log("❌ 无法恢复，停止")
+                    break
+
+            result = extract_data_with_selenium(self.ctx.driver)
+
             if not result or not result.get('title'):
                 self.log("  ❌ 抓取失败！")
                 fail_count += 1
+                consecutive_fails += 1
+
+                if consecutive_fails >= 3:
+                    self.log(f"\n⚠️ 连续 {consecutive_fails} 次失败，尝试重启 Chrome...")
+                    if self.ctx.handle_block(url):
+                        self.log("✅ 已恢复，继续")
+                        consecutive_fails = 0
+                    else:
+                        self.log("❌ 无法恢复，停止")
+                        break
                 continue
-            
+
             success_count += 1
+            consecutive_fails = 0
             self.log(f"  ✅ {result.get('title', '')[:40]}...")
             self.log(f"  📷 图片: {len(result.get('images', []))} 张")
-            
+
             product_id = result.get('product_id', 'unknown')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             json_path = output_path / f"product_{product_id}_{timestamp}.json"
             json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
-            
+
             self._download_images(result.get('images', []), result.get('title', ''), output_path)
-            
+
+            # driver 可能在封锁恢复后被替换，同步引用
+            self.driver = self.ctx.driver
+            self.chrome_process = self.ctx.chrome_process
+
             if idx < total:
                 time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
-        
+
         self.update_progress(total, total)
         self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {success_count}, 失败: {fail_count}"))
     
@@ -318,7 +329,7 @@ class ScraperWorker:
                     completed_ids = progress.load()
                     if completed_ids:
                         self.log(f"  📋 已完成: {len(completed_ids)} 个")
-                except:
+                except Exception:
                     pass
             
             listing_ids = extract_product_links(self.driver, url, total_items=total_items)
@@ -378,10 +389,10 @@ class ScraperWorker:
     
     def _download_images(self, images: List[str], title: str, output_dir: Path):
         import requests
-        
+
         if not images or not title:
             return
-        
+
         try:
             from .utils import filter_title
         except ImportError:
@@ -389,32 +400,32 @@ class ScraperWorker:
         display_title = title
         if self.filter_words:
             display_title = filter_title(title, self.filter_words)
-        
+
         safe_title = sanitize_filename(display_title)
-        
+
         if self.image_selection:
             download_list = [(i, images[i-1]) for i in self.image_selection if 1 <= i <= len(images)]
         else:
             download_list = [(i+1, url) for i, url in enumerate(images)]
-        
+
         headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "User-Agent": get_random_ua(),
             "Referer": "https://www.etsy.com/"
         }
-        
+
         for idx, url in download_list:
             try:
                 ext = url.split('.')[-1].split('?')[0] or 'jpg'
                 filename = f"{safe_title}-{idx}.{ext}"
                 filepath = output_dir / filename
-                
+
                 resp = requests.get(url, headers=headers, timeout=30)
                 if resp.status_code == 200:
                     filepath.write_bytes(resp.content)
                     self.log(f"    📥 图片 {idx}")
-            except:
+            except Exception:
                 self.log(f"    ❌ 图片 {idx} 下载失败")
-            
+
             time.sleep(random.uniform(0.3, 0.8))
 
 
@@ -491,19 +502,6 @@ class App(ctk.CTk):
         self.progress_label.pack(side="left")
         
         # 右边：按钮
-        self.confirm_btn = ctk.CTkButton(
-            control_frame,
-            text="✅ 继续抓取",
-            font=ctk.CTkFont(size=14, weight="bold"),
-            fg_color="#28a745",
-            hover_color="#218838",
-            width=120,
-            height=40,
-            state="disabled",
-            command=self.on_confirm
-        )
-        self.confirm_btn.pack(side="right", padx=(10, 0))
-        
         self.stop_btn = ctk.CTkButton(
             control_frame,
             text="⏹️ 停止",
@@ -810,22 +808,11 @@ class App(ctk.CTk):
         self.product_start_btn.configure(state="disabled")
         self.section_start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.confirm_btn.configure(state="disabled")
         self.progress_bar.set(0)
         self.progress_label.configure(text="启动中...")
         
         self.worker = ScraperWorker(self, **kwargs)
         self.worker.start()
-    
-    def on_chrome_ready(self):
-        self.confirm_btn.configure(state="normal")
-        self.progress_label.configure(text="等待验证...")
-    
-    def on_confirm(self):
-        if self.worker:
-            self.worker.user_confirm()
-            self.confirm_btn.configure(state="disabled")
-            self.progress_label.configure(text="抓取中...")
     
     def on_stop(self):
         if self.worker:
@@ -836,7 +823,6 @@ class App(ctk.CTk):
         self.product_start_btn.configure(state="normal")
         self.section_start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
-        self.confirm_btn.configure(state="disabled")
         
         if success:
             self.log(f"\n🎉 {message}")

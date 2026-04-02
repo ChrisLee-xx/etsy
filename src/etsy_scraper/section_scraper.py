@@ -160,8 +160,12 @@ try:
         get_chrome_path,
         start_chrome_with_debug,
         wait_for_chrome_ready,
-        extract_data_with_selenium,
         create_patched_driver,
+        get_random_ua,
+        _is_access_blocked,
+        _restart_chrome_fresh,
+        _DriverContext,
+        _extract_product_images,
     )
 except ImportError:
     from real_chrome_scraper import (
@@ -169,8 +173,12 @@ except ImportError:
         get_chrome_path,
         start_chrome_with_debug,
         wait_for_chrome_ready,
-        extract_data_with_selenium,
         create_patched_driver,
+        get_random_ua,
+        _is_access_blocked,
+        _restart_chrome_fresh,
+        _DriverContext,
+        _extract_product_images,
     )
 
 
@@ -462,7 +470,7 @@ def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
                         total_items = int(count_match.group(1))
                     print(f"  ✓ 从侧边栏获取: {section_name} ({total_items} 件商品)")
                     return section_name, total_items
-        except:
+        except Exception:
             continue
     
     print(f"  ⚠️ 未能获取 Section 信息，将使用默认值")
@@ -581,10 +589,10 @@ def download_images_to_section(
         download_list = [(i+1, url) for i, url in enumerate(images)]
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "User-Agent": get_random_ua(),
         "Referer": "https://www.etsy.com/"
     }
-    
+
     downloaded = 0
     for idx, url in download_list:
         try:
@@ -613,104 +621,6 @@ def download_images_to_section(
         time.sleep(random.uniform(0.2, 0.5))
     
     return downloaded
-
-
-def _is_access_blocked(driver) -> bool:
-    """检测当前页面是否触发了 Etsy 的访问限制"""
-    try:
-        url = driver.current_url.lower()
-        if 'captcha' in url or 'datadome' in url or 'geo.captcha-delivery' in url:
-            return True
-        title = driver.title.lower()
-        if 'robot' in title or 'captcha' in title or 'restricted' in title:
-            return True
-        page_source = driver.page_source
-        if '访问暂时受限' in page_source or 'temporarily restricted' in page_source.lower():
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
-    """
-    清理 profile 并重启 Chrome，返回 (new_chrome_process, new_driver)。
-    用于被封锁后自动恢复。
-    """
-    import shutil
-
-    print("\n    🔄 自动重启 Chrome（清理旧 session）...")
-
-    # 关闭旧 Chrome
-    if chrome_process:
-        try:
-            chrome_process.terminate()
-            chrome_process.wait(timeout=5)
-        except Exception:
-            try:
-                chrome_process.kill()
-            except Exception:
-                pass
-    time.sleep(2)
-
-    # 删除 profile（清掉被标记的 cookies/session）
-    profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
-    if profile_dir.exists():
-        try:
-            shutil.rmtree(profile_dir)
-            print("    ✓ 已清理旧 profile")
-        except Exception:
-            pass
-
-    # 重启
-    new_chrome = start_chrome_with_debug(url, port)
-    if not wait_for_chrome_ready(port):
-        print("    ❌ Chrome 重启失败")
-        return None, None
-
-    new_driver = create_patched_driver(port)
-    print("    ✅ Chrome 已重启，全新 session")
-    return new_chrome, new_driver
-
-
-class _DriverContext:
-    """在抓取循环中共享可替换的 driver 和 chrome_process"""
-    def __init__(self, driver, chrome_process, port: int = 9222):
-        self.driver = driver
-        self.chrome_process = chrome_process
-        self.port = port
-
-    def handle_block(self, url: str) -> bool:
-        """
-        检测到封锁后自动重启 Chrome。
-        等 30 秒冷却后重启，然后导航到目标 URL 验证是否恢复。
-        最多尝试 3 次。
-        """
-        for attempt in range(1, 4):
-            cooldown = 30 * attempt
-            print(f"    🚫 访问被限制，等待 {cooldown} 秒后重启 Chrome（第 {attempt} 次）...")
-            time.sleep(cooldown)
-
-            new_chrome, new_driver = _restart_chrome_fresh(
-                self.chrome_process, url, self.port
-            )
-            if not new_driver:
-                continue
-
-            self.chrome_process = new_chrome
-            self.driver = new_driver
-
-            try:
-                self.driver.get(url)
-                time.sleep(random.uniform(3, 5))
-            except Exception:
-                continue
-
-            if not _is_access_blocked(self.driver):
-                return True
-
-        print("    ❌ 多次重启仍被限制")
-        return False
 
 
 def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
@@ -770,19 +680,13 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
 
 def extract_product_data_silent(driver) -> Optional[Dict]:
     """
-    静默提取商品数据（不显示验证提示）
-    这是 extract_data_with_selenium 的简化版本
-    
-    Args:
-        driver: Selenium WebDriver 实例
-        
-    Returns:
-        商品数据字典
+    静默提取商品数据（标题 + 图片）。
+    批量模式使用，图片提取复用 _extract_product_images。
     """
     from selenium.webdriver.common.by import By
-    
+
     data = {}
-    
+
     # 模拟人类滚动
     for _ in range(2):
         scroll_distance = random.randint(200, 400)
@@ -790,71 +694,21 @@ def extract_product_data_silent(driver) -> Optional[Dict]:
         time.sleep(random.uniform(0.3, 0.8))
     driver.execute_script("window.scrollTo(0, 0)")
     time.sleep(0.5)
-    
+
     # 提取标题
     try:
         title_el = driver.find_element(By.CSS_SELECTOR, 'h1[data-buy-box-listing-title="true"]')
         data['title'] = title_el.text.strip()
-    except:
+    except Exception:
         try:
             title_el = driver.find_element(By.TAG_NAME, 'h1')
             data['title'] = title_el.text.strip()
-        except:
+        except Exception:
             data['title'] = None
-    
-    # 提取图片 - 使用优化后的方法
-    images = []
-    seen_ids = set()
-    
-    def extract_image_id(url):
-        match = re.search(r'/il_[^.]+\.(\d+)_', url)
-        return match.group(1) if match else None
-    
-    def convert_to_fullsize(url):
-        return re.sub(r'il_[^.]+\.', 'il_fullxfull.', url)
-    
-    # 方法0: data-src-zoom-image（最优先）
-    try:
-        zoom_imgs = driver.find_elements(
-            By.CSS_SELECTOR, 
-            'li[data-carousel-pane]:not([data-video-pane]) img[data-src-zoom-image]'
-        )
-        for img in zoom_imgs:
-            zoom_url = img.get_attribute('data-src-zoom-image')
-            if zoom_url and 'etsystatic.com' in zoom_url:
-                img_id = extract_image_id(zoom_url)
-                if img_id and img_id not in seen_ids:
-                    seen_ids.add(img_id)
-                    images.append(zoom_url)
-    except:
-        pass
-    
-    # 方法1: 画廊区域（备选）
-    if not images:
-        gallery_selectors = [
-            'div[data-component="listing-page-image-carousel"] img',
-            'ul[data-carousel-pagination-list] img',
-            'ul.carousel-pane-list img[src*="il_"]',
-        ]
-        
-        for selector in gallery_selectors:
-            try:
-                gallery_imgs = driver.find_elements(By.CSS_SELECTOR, selector)
-                for img in gallery_imgs:
-                    src = img.get_attribute('src') or img.get_attribute('data-src')
-                    if src and 'il_' in src and 'etsystatic.com' in src:
-                        img_id = extract_image_id(src)
-                        if img_id and img_id not in seen_ids:
-                            seen_ids.add(img_id)
-                            images.append(convert_to_fullsize(src))
-                if images:
-                    break
-            except:
-                continue
-    
-    # 去重并限制数量
-    data['images'] = list(dict.fromkeys(images))[:15]
-    
+
+    # 图片（使用共享提取函数，包含全部 4 种回退方法）
+    data['images'] = _extract_product_images(driver)
+
     return data
 
 
@@ -953,10 +807,9 @@ def main():
   - 使用 --clear-progress 清理进度文件后退出
 
 工作流程:
-  1. 启动 Chrome 并打开 Section 页面
-  2. 你手动完成验证（如果需要）
-  3. 按 Enter 开始自动抓取
-  4. 自动遍历所有商品并下载图片（多链接会依次处理）
+  1. 自动启动 Chrome 并打开 Section 页面
+  2. 自动遍历所有商品并下载图片
+  3. 遇到访问限制自动重启 Chrome 恢复
 """
     )
     
@@ -1069,39 +922,23 @@ def main():
     # 步骤 1：启动 Chrome
     print("\n📌 步骤 1: 启动 Chrome")
     print("-" * 40)
-    print("⚠️  请先关闭所有 Chrome 窗口！")
-    input("准备好后按 Enter 继续...")
     
-    print("\n启动 Chrome...")
+    print("启动 Chrome...")
     chrome_process = start_chrome_with_debug(sections[0]['url'], args.port)
     
     print("等待浏览器就绪...")
     if not wait_for_chrome_ready(args.port):
-        print("❌ Chrome 启动失败！")
+        print("❌ Chrome 启动失败！请先关闭所有 Chrome 窗口后重试。")
         chrome_process.terminate()
         sys.exit(1)
     
-    print("✓ Chrome 已启动！")
-    
-    # 步骤 2：等待用户完成验证
-    print("\n" + "=" * 60)
-    print("📌 步骤 2: 完成验证")
-    print("-" * 40)
-    print("""
-在打开的 Chrome 窗口中：
-
-  1. 如果看到验证页面，请完成「我不是机器人」验证
-  2. 等待 Section 页面完全加载
-  3. 确认能看到商品列表
-
-⏰ 没有时间限制，慢慢来！
-""")
-    print("=" * 60)
-    
-    input("\n✋ 验证完成、页面加载好后，按 Enter 继续...")
+    print("✅ Chrome 已启动！")
     
     driver = create_patched_driver(args.port)
     ctx = _DriverContext(driver, chrome_process, args.port)
+    
+    # 等待页面加载
+    time.sleep(3)
     
     # 统计
     total_success = 0
@@ -1209,15 +1046,6 @@ def main():
                 sections_completed += 1
                 continue
             
-            # 确认继续（只有单个 Section 时询问）
-            if total_sections == 1:
-                print("\n" + "=" * 60)
-                confirm = input(f"是否开始下载 {len(pending_ids)} 个商品的图片? (Y/n): ")
-                if confirm.lower() == 'n':
-                    print("已取消")
-                    chrome_process.terminate()
-                    sys.exit(0)
-            
             # 处理商品
             print(f"\n  📌 下载商品图片 ({len(pending_ids)} 个)...")
             
@@ -1262,15 +1090,11 @@ def main():
         print(f"  输出目录: {args.output}")
         
     finally:
-        close = input("\n是否关闭 Chrome 浏览器? (y/N): ")
-        if close.lower() == 'y':
-            try:
-                ctx.chrome_process.terminate()
-            except Exception:
-                pass
-            print("浏览器已关闭")
-        else:
-            print("浏览器保持打开")
+        try:
+            ctx.chrome_process.terminate()
+        except Exception:
+            pass
+        print("浏览器已关闭")
 
 
 if __name__ == "__main__":

@@ -91,6 +91,7 @@ def build_app():
         "--hidden-import", "charset_normalizer",
         "--hidden-import", "idna",
         "--hidden-import", "customtkinter",
+        "--hidden-import", "undetected_chromedriver",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",
         "--hidden-import", "PIL._tkinter_finder",

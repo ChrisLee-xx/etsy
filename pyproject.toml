@@ -10,7 +10,6 @@ requires-python = ">=3.11,<3.15"
 dependencies = [
     "selenium (>=4.15.0)",
     "requests (>=2.31.0)",
-    "pyqt6 (>=6.10.2,<7.0.0)",
     "pyinstaller (>=6.18.0,<7.0.0)",
     "customtkinter (>=5.2.2,<6.0.0)",
     "undetected-chromedriver (>=3.5.5,<4.0.0)"
