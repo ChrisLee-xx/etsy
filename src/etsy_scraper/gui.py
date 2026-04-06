@@ -944,19 +944,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # 单实例检测：防止重复启动多个窗口
-    import socket
-    _single_instance = None
-    try:
-        _single_instance = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        _single_instance.bind("/tmp/.etsy_scraper.lock")
-    except (FileExistsError, OSError):
-        # 已有实例运行
-        try:
-            from tkinter import messagebox
-            messagebox.showwarning("提示", "Etsy Scraper 已在运行中！")
-        except Exception:
-            pass
-        sys.exit(1)
-    
     main()
