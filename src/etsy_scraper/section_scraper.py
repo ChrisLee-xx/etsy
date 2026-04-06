@@ -260,7 +260,8 @@ def build_page_url(section_url: str, page: int) -> str:
     return new_url
 
 
-def extract_product_links(driver, section_url: str, total_items: int = 0) -> List[str]:
+def extract_product_links(driver, section_url: str, total_items: int = 0,
+                          stop_check=None) -> List[str]:
     """
     从 Section 页面提取所有商品链接（基于 URL 参数翻页）
     
@@ -273,6 +274,7 @@ def extract_product_links(driver, section_url: str, total_items: int = 0) -> Lis
         driver: Selenium WebDriver 实例
         section_url: Section 页面 URL
         total_items: Section 总商品数（用于计算总页数，0 则逐页探测）
+        stop_check: 可选的停止检查回调函数，返回 True 时提前退出翻页循环
         
     Returns:
         商品 listing_id 列表
@@ -288,6 +290,11 @@ def extract_product_links(driver, section_url: str, total_items: int = 0) -> Lis
     print(f"\n📊 Section 总商品数: {total_items}" if total_items > 0 else "\n📊 总商品数未知，将逐页探测")
     
     while True:
+        # 检查停止信号
+        if stop_check and stop_check():
+            print("  → 收到停止信号，停止翻页")
+            break
+
         # 构造当前页 URL
         page_url = build_page_url(section_url, current_page)
         
@@ -491,6 +498,7 @@ class ImageNameTracker:
     def __init__(self):
         # 记录每个商品名称出现的次数
         self.name_counts: Dict[str, int] = defaultdict(int)
+        self._last_suffix: str = ""
     
     def get_suffix(self, product_name: str) -> str:
         """
@@ -1090,10 +1098,11 @@ def main():
         print(f"  输出目录: {args.output}")
         
     finally:
-        try:
-            ctx.chrome_process.terminate()
-        except Exception:
-            pass
+        if ctx.chrome_process and ctx.chrome_process.poll() is None:
+            try:
+                ctx.chrome_process.terminate()
+            except Exception:
+                pass
         print("浏览器已关闭")
 
 

@@ -1,16 +1,22 @@
 """
 Etsy Scraper GUI - CustomTkinter 桌面应用
 """
+import certifi
 import json
 import os
 import random
+import ssl
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Set
+
+# 修复 macOS 上 Python 的 SSL 证书问题
+ssl._create_default_https_context = ssl._create_unverified_context
 
 # PyInstaller 打包后，添加 _MEIPASS 到 sys.path
 if getattr(sys, 'frozen', False):
@@ -147,7 +153,29 @@ class ScraperWorker:
     
     def stop(self):
         self._stop_flag = True
+        # 主动中断 Selenium session（立即解除所有 driver 阻塞调用）
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+        # 强制关闭 Chrome 进程
+        if self.chrome_process:
+            try:
+                self.chrome_process.terminate()
+            except Exception:
+                pass
+            self.chrome_process = None
     
+    
+    def _safe_terminate(self, proc):
+        """安全终止进程，仅当进程存活时才调用 terminate"""
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
     
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -187,15 +215,13 @@ class ScraperWorker:
                 self._scrape_sections()
             
         except Exception as e:
-            self.app.after(0, lambda: self.app.on_finished(False, f"错误: {str(e)}"))
+            tb = traceback.format_exc()
+            error_msg = f"{type(e).__name__}: {e}"
+            self.log(f"❌ {tb}")
+            self.app.after(0, lambda m=error_msg: self.app.on_finished(False, f"错误: {m}"))
         finally:
-            try:
-                if hasattr(self, 'ctx') and self.ctx and self.ctx.chrome_process:
-                    self.ctx.chrome_process.terminate()
-                elif self.chrome_process:
-                    self.chrome_process.terminate()
-            except Exception:
-                pass
+            self._safe_terminate(self.ctx.chrome_process if hasattr(self, 'ctx') and self.ctx else None)
+            self._safe_terminate(self.chrome_process)
     
     def _scrape_products(self):
         total = len(self.urls)
@@ -268,16 +294,27 @@ class ScraperWorker:
             if idx < total:
                 time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
 
-        self.update_progress(total, total)
-        self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {success_count}, 失败: {fail_count}"))
+        if not self._stop_flag:
+            self.update_progress(total, total)
+        if self._stop_flag:
+            if success_count > 0:
+                self.app.after(0, lambda: self.app.on_finished(True,
+                    f"已中断！部分完成 - 成功: {success_count}, 失败: {fail_count}"))
+            else:
+                self.app.after(0, lambda: self.app.on_finished(False,
+                    f"已中断！成功: {success_count}, 失败: {fail_count}"))
+        else:
+            self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {success_count}, 失败: {fail_count}"))
     
     def _scrape_sections(self):
         total_sections = len(self.urls)
         total_success = 0
         total_fail = 0
+        stopped_early = False
         
         for sec_idx, url in enumerate(self.urls, 1):
             if self._stop_flag:
+                stopped_early = True
                 break
             
             try:
@@ -332,7 +369,8 @@ class ScraperWorker:
                 except Exception:
                     pass
             
-            listing_ids = extract_product_links(self.driver, url, total_items=total_items)
+            listing_ids = extract_product_links(self.driver, url, total_items=total_items,
+                                                 stop_check=lambda: self._stop_flag)
             
             if not listing_ids:
                 self.log("  ❌ 没有找到商品")
@@ -355,6 +393,7 @@ class ScraperWorker:
                     break
                 
                 self.update_progress(i, len(pending_ids))
+                self.log(f"  [{i}/{len(pending_ids)}] 处理商品 {listing_id}...")
                 
                 if process_product(self.ctx, listing_id, output_path, name_tracker,
                                   image_selection=self.image_selection,
@@ -362,9 +401,11 @@ class ScraperWorker:
                     total_success += 1
                     consecutive_fails = 0
                     progress.save(listing_id)
+                    self.log(f"    ✅ [{i}/{len(pending_ids)}] 完成")
                 else:
                     total_fail += 1
                     consecutive_fails += 1
+                    self.log(f"    ❌ [{i}/{len(pending_ids)}] 失败")
                     
                     if consecutive_fails >= 3:
                         product_url = f"https://www.etsy.com/listing/{listing_id}"
@@ -374,6 +415,7 @@ class ScraperWorker:
                             consecutive_fails = 0
                         else:
                             self.log("❌ 无法恢复，停止当前 Section")
+                            stopped_early = True
                             break
 
                 # driver 可能在封锁恢复后被替换，同步引用
@@ -383,9 +425,19 @@ class ScraperWorker:
                 if i < len(pending_ids):
                     time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
             
-            self.update_progress(len(pending_ids), len(pending_ids))
+            if not self._stop_flag:
+                self.update_progress(len(pending_ids), len(pending_ids))
         
-        self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {total_success}, 失败: {total_fail}"))
+        # 区分正常完成和提前退出（stop 或连续失败）
+        if stopped_early or self._stop_flag:
+            if total_success > 0:
+                self.app.after(0, lambda: self.app.on_finished(True,
+                    f"已中断！部分完成 - 成功: {total_success}, 失败: {total_fail}"))
+            else:
+                self.app.after(0, lambda: self.app.on_finished(False,
+                    f"已中断！成功: {total_success}, 失败: {total_fail}"))
+        else:
+            self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {total_success}, 失败: {total_fail}"))
     
     def _download_images(self, images: List[str], title: str, output_dir: Path):
         import requests
@@ -414,6 +466,8 @@ class ScraperWorker:
         }
 
         for idx, url in download_list:
+            if self._stop_flag:
+                return
             try:
                 ext = url.split('.')[-1].split('?')[0] or 'jpg'
                 filename = f"{safe_title}-{idx}.{ext}"
@@ -804,6 +858,11 @@ class App(ctk.CTk):
         )
     
     def start_worker(self, **kwargs):
+        # 如果已有运行中的 worker，忽略重复启动
+        if self.worker is not None:
+            # worker 还在清理中（on_finished 尚未执行），忽略本次请求
+            return
+        
         self.log_text.delete("0.0", "end")
         self.product_start_btn.configure(state="disabled")
         self.section_start_btn.configure(state="disabled")
@@ -818,11 +877,22 @@ class App(ctk.CTk):
         if self.worker:
             self.worker.stop()
             self.log("⚠️ 正在停止...")
+        
+        # 5秒超时保护：如果线程未及时退出，强制恢复 UI
+        def force_finish():
+            if self.worker is None:  # 已被正常的 on_finished 清理过
+                return
+            if self.worker._thread.is_alive():
+                self.log("⏱️ 强制结束抓取...")
+            self.on_finished(False, "已手动停止")
+        
+        self.after(5000, force_finish)
     
     def on_finished(self, success: bool, message: str):
         self.product_start_btn.configure(state="normal")
         self.section_start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.worker = None
         
         if success:
             self.log(f"\n🎉 {message}")
@@ -831,7 +901,7 @@ class App(ctk.CTk):
         else:
             self.log(f"\n❌ {message}")
             self.progress_label.configure(text="❌ 失败")
-            if "取消" not in message:
+            if "取消" not in message and "手动停止" not in message:
                 messagebox.showerror("错误", message)
 
 
@@ -859,7 +929,11 @@ class App(ctk.CTk):
         save_config(config)
     
     def _on_close(self):
-        """关闭窗口时保存配置"""
+        """关闭窗口时停止 worker 并保存配置"""
+        if self.worker:
+            self.worker.stop()
+            if self.worker._thread and self.worker._thread.is_alive():
+                self.worker._thread.join(timeout=2.0)
         self._save_current_config()
         self.destroy()
 
@@ -870,4 +944,19 @@ def main():
 
 
 if __name__ == "__main__":
+    # 单实例检测：防止重复启动多个窗口
+    import socket
+    _single_instance = None
+    try:
+        _single_instance = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        _single_instance.bind("/tmp/.etsy_scraper.lock")
+    except (FileExistsError, OSError):
+        # 已有实例运行
+        try:
+            from tkinter import messagebox
+            messagebox.showwarning("提示", "Etsy Scraper 已在运行中！")
+        except Exception:
+            pass
+        sys.exit(1)
+    
     main()
