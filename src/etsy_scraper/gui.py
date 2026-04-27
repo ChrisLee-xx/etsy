@@ -37,7 +37,7 @@ try:
     from .real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
         create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
-        _DriverContext, _is_access_blocked, get_random_ua,
+        _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
     )
     from .utils import parse_image_selection, parse_filter_words
 except ImportError:
@@ -49,7 +49,7 @@ except ImportError:
     from real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
         create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
-        _DriverContext, _is_access_blocked, get_random_ua,
+        _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
     )
     from utils import parse_image_selection, parse_filter_words
 
@@ -243,10 +243,20 @@ class ScraperWorker:
                     self.ctx.driver.get(url)
                     time.sleep(2)
                 except Exception as e:
-                    self.log(f"  ❌ 导航失败: {e}")
-                    fail_count += 1
-                    consecutive_fails += 1
-                    continue
+                    if _is_browser_disconnected(e):
+                        self.log(f"  🔌 Chrome 连接断开，立即重启后重试...")
+                        if self.ctx.handle_block(url, immediate=True):
+                            self.driver = self.ctx.driver
+                            self.chrome_process = self.ctx.chrome_process
+                            consecutive_fails = 0
+                        else:
+                            self.log("  ❌ 无法恢复，停止")
+                            break
+                    else:
+                        self.log(f"  ❌ 导航失败: {e}")
+                        fail_count += 1
+                        consecutive_fails += 1
+                        continue
 
             # 封锁检测
             if _is_access_blocked(self.ctx.driver):
@@ -258,7 +268,25 @@ class ScraperWorker:
                     self.log("❌ 无法恢复，停止")
                     break
 
-            result = extract_data_with_selenium(self.ctx.driver)
+            try:
+                result = extract_data_with_selenium(self.ctx.driver)
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    self.log("  🔌 Chrome 连接断开，立即重启后重试当前商品...")
+                    if self.ctx.handle_block(url, immediate=True):
+                        self.driver = self.ctx.driver
+                        self.chrome_process = self.ctx.chrome_process
+                        try:
+                            result = extract_data_with_selenium(self.ctx.driver)
+                        except Exception as retry_error:
+                            self.log(f"  ❌ 重试仍失败: {retry_error}")
+                            result = None
+                    else:
+                        self.log("  ❌ 无法恢复，停止")
+                        break
+                else:
+                    self.log(f"  ❌ 提取失败: {e}")
+                    result = None
 
             if not result or not result.get('title'):
                 self.log("  ❌ 抓取失败！")
@@ -267,7 +295,7 @@ class ScraperWorker:
 
                 if consecutive_fails >= 3:
                     self.log(f"\n⚠️ 连续 {consecutive_fails} 次失败，尝试重启 Chrome...")
-                    if self.ctx.handle_block(url):
+                    if self.ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
                         self.log("✅ 已恢复，继续")
                         consecutive_fails = 0
                     else:
@@ -327,14 +355,35 @@ class ScraperWorker:
             
             if sec_idx > 1:
                 try:
-                    self.driver.get(url)
+                    self.ctx.driver.get(url)
                     time.sleep(2)
                 except Exception as e:
-                    self.log(f"  ❌ 导航失败: {e}")
-                    continue
+                    self.log(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")
+                    if self.ctx.handle_block(url):
+                        self.driver = self.ctx.driver
+                        self.chrome_process = self.ctx.chrome_process
+                        self.log("  ✅ 已恢复")
+                    else:
+                        self.log("  ❌ 无法恢复，跳过此 Section")
+                        continue
             
-            # 获取 Section 信息（在创建输出目录之前）
-            section_name, total_items = get_section_info(self.driver, section_id)
+            # 获取 Section 信息（在创建输出目录之前），Chrome 断连时自动恢复
+            try:
+                section_name, total_items = get_section_info(self.ctx.driver, section_id)
+            except Exception as e:
+                self.log(f"  ❌ 获取 Section 信息失败: {e}，尝试重启 Chrome...")
+                if self.ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                    self.driver = self.ctx.driver
+                    self.chrome_process = self.ctx.chrome_process
+                    self.log("  ✅ 已恢复，重试...")
+                    try:
+                        section_name, total_items = get_section_info(self.ctx.driver, section_id)
+                    except Exception as retry_error:
+                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
+                        continue
+                else:
+                    self.log("  ❌ 无法恢复，跳过此 Section")
+                    continue
             self.log(f"  Section: {section_name} ({total_items} 件)")
             
             # 使用 section 名称命名文件夹
@@ -369,8 +418,24 @@ class ScraperWorker:
                 except Exception:
                     pass
             
-            listing_ids = extract_product_links(self.driver, url, total_items=total_items,
-                                                 stop_check=lambda: self._stop_flag)
+            try:
+                listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
+                                                     stop_check=lambda: self._stop_flag)
+            except Exception as e:
+                self.log(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
+                if self.ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                    self.driver = self.ctx.driver
+                    self.chrome_process = self.ctx.chrome_process
+                    self.log("  ✅ 已恢复，重试...")
+                    try:
+                        listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
+                                                             stop_check=lambda: self._stop_flag)
+                    except Exception as retry_error:
+                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
+                        continue
+                else:
+                    self.log("  ❌ 无法恢复，跳过此 Section")
+                    continue
             
             if not listing_ids:
                 self.log("  ❌ 没有找到商品")

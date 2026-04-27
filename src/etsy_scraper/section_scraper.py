@@ -163,6 +163,7 @@ try:
         create_patched_driver,
         get_random_ua,
         _is_access_blocked,
+        _is_browser_disconnected,
         _restart_chrome_fresh,
         _DriverContext,
         _extract_product_images,
@@ -176,6 +177,7 @@ except ImportError:
         create_patched_driver,
         get_random_ua,
         _is_access_blocked,
+        _is_browser_disconnected,
         _restart_chrome_fresh,
         _DriverContext,
         _extract_product_images,
@@ -303,12 +305,16 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         else:
             print(f"\n📄 正在处理第 {current_page} 页...")
         
-        # 导航到当前页
-        driver.get(page_url)
-        time.sleep(3)  # 等待页面加载
-        
-        # 滚动页面以触发懒加载
-        scroll_page(driver)
+        # 导航到当前页并滚动触发懒加载；Chrome 断连时向外抛出，交给上层重启恢复
+        try:
+            driver.get(page_url)
+            time.sleep(3)  # 等待页面加载
+            scroll_page(driver)
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
+            print(f"  ✗ 页面加载失败: {e}")
+            break
         
         # 提取当前页的商品 listing_id
         try:
@@ -344,6 +350,8 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
                     break
             
         except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
             print(f"  ✗ 提取商品失败: {e}")
             break
         
@@ -419,6 +427,8 @@ def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
                 print(f"  ✓ 从下拉菜单获取: {section_name} ({total_items} 件商品)")
                 return section_name, total_items
         except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
             print(f"  方法1 (button data-section-id) 未匹配: {type(e).__name__}")
         
         # 方法2: 大屏幕侧边栏 - 查找 li[data-section-id]
@@ -437,6 +447,8 @@ def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
                 print(f"  ✓ 从侧边栏获取: {section_name} ({total_items} 件商品)")
                 return section_name, total_items
         except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
             print(f"  方法2 (li data-section-id) 未匹配: {type(e).__name__}")
     
     # 方法3: 小屏幕 - 从下拉菜单触发按钮获取当前选中项
@@ -454,6 +466,8 @@ def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
             print(f"  ✓ 从下拉菜单触发器获取: {section_name} ({total_items} 件商品)")
             return section_name, total_items
     except Exception as e:
+        if _is_browser_disconnected(e):
+            raise
         print(f"  方法3 (menu trigger) 未匹配: {type(e).__name__}")
     
     # 方法4: 查找选中的 tab（大屏幕侧边栏备用方案）
@@ -477,7 +491,9 @@ def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
                         total_items = int(count_match.group(1))
                     print(f"  ✓ 从侧边栏获取: {section_name} ({total_items} 件商品)")
                     return section_name, total_items
-        except Exception:
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
             continue
     
     print(f"  ⚠️ 未能获取 Section 信息，将使用默认值")
@@ -632,7 +648,8 @@ def download_images_to_section(
 
 
 def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
-                    image_selection: List[int] = None, filter_words: List[str] = None) -> bool:
+                    image_selection: List[int] = None, filter_words: List[str] = None,
+                    retry_on_disconnect: bool = True) -> bool:
     """
     处理单个商品：导航、提取数据、下载图片
 
@@ -682,6 +699,18 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
             return False
 
     except Exception as e:
+        if _is_browser_disconnected(e) and retry_on_disconnect:
+            print(f"    🔌 Chrome 连接断开，重启后重试当前商品...")
+            if ctx.handle_block(product_url, immediate=True):
+                return process_product(
+                    ctx,
+                    listing_id,
+                    output_dir,
+                    name_tracker,
+                    image_selection=image_selection,
+                    filter_words=filter_words,
+                    retry_on_disconnect=False,
+                )
         print(f"    ✗ 处理失败: {e}")
         return False
 
@@ -978,12 +1007,29 @@ def main():
                     ctx.driver.execute_script("window.scrollTo(0, 0)")
                     time.sleep(1)
                 except Exception as e:
-                    print(f"  ❌ 导航失败: {e}")
-                    continue
+                    print(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")
+                    if ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                        print("  ✅ 已恢复")
+                    else:
+                        print("  ❌ 无法恢复，跳过此 Section")
+                        continue
             
-            # 获取 Section 信息（在创建输出目录之前获取 section 名称）
+            # 获取 Section 信息（在创建输出目录之前获取 section 名称），Chrome 断连时自动恢复
             print(f"\n  📌 获取 Section 信息...")
-            section_name, total_items = get_section_info(ctx.driver, section_id)
+            try:
+                section_name, total_items = get_section_info(ctx.driver, section_id)
+            except Exception as e:
+                print(f"  ❌ 获取 Section 信息失败: {e}，尝试重启 Chrome...")
+                if ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                    print("  ✅ 已恢复，重试...")
+                    try:
+                        section_name, total_items = get_section_info(ctx.driver, section_id)
+                    except Exception as retry_error:
+                        print(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
+                        continue
+                else:
+                    print("  ❌ 无法恢复，跳过此 Section")
+                    continue
             print(f"    Section: {section_name}")
             print(f"    预计商品数: {total_items}")
             
@@ -1028,7 +1074,20 @@ def main():
             print(f"\n  📌 提取商品链接...")
             
             # 提取所有商品链接（传入 total_items 用于计算翻页）
-            listing_ids = extract_product_links(ctx.driver, url, total_items=total_items)
+            try:
+                listing_ids = extract_product_links(ctx.driver, url, total_items=total_items)
+            except Exception as e:
+                print(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
+                if ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                    print("  ✅ 已恢复，重试...")
+                    try:
+                        listing_ids = extract_product_links(ctx.driver, url, total_items=total_items)
+                    except Exception as retry_error:
+                        print(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
+                        continue
+                else:
+                    print("  ❌ 无法恢复，跳过此 Section")
+                    continue
             
             if not listing_ids:
                 print(f"\n  ❌ 没有找到任何商品！")

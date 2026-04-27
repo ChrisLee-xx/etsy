@@ -149,6 +149,22 @@ def _is_access_blocked(driver) -> bool:
     return False
 
 
+def _is_browser_disconnected(exc: Exception) -> bool:
+    """判断 Selenium 异常是否属于 Chrome/DevTools session 已断开。"""
+    msg = str(exc).lower()
+    disconnected_signals = [
+        "invalid session id",
+        "session deleted",
+        "not connected to devtools",
+        "disconnected",
+        "chrome not reachable",
+        "target window already closed",
+        "no such window",
+        "web view not found",
+    ]
+    return any(signal in msg for signal in disconnected_signals)
+
+
 def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
     """
     清理 profile 并重启 Chrome，返回 (new_chrome_process, new_driver)。
@@ -192,15 +208,19 @@ class _DriverContext:
         self.chrome_process = chrome_process
         self.port = port
 
-    def handle_block(self, url: str) -> bool:
+    def handle_block(self, url: str, immediate: bool = False) -> bool:
         """
         检测到封锁后自动重启 Chrome。
         等待冷却后重启，最多尝试 3 次。
+        如果是 Chrome/DevTools 断连，immediate=True 会立即重启第一次。
         """
         for attempt in range(1, 4):
-            cooldown = 30 * attempt
-            print(f"    🚫 访问被限制，等待 {cooldown} 秒后重启 Chrome（第 {attempt} 次）...")
-            time.sleep(cooldown)
+            cooldown = 0 if immediate and attempt == 1 else 30 * attempt
+            if cooldown > 0:
+                print(f"    🚫 访问被限制，等待 {cooldown} 秒后重启 Chrome（第 {attempt} 次）...")
+                time.sleep(cooldown)
+            else:
+                print(f"    🔌 Chrome 连接已断开，立即重启 Chrome（第 {attempt} 次）...")
 
             new_chrome, new_driver = _restart_chrome_fresh(
                 self.chrome_process, url, self.port
@@ -259,6 +279,8 @@ def _extract_product_images(driver) -> List[str]:
         if images:
             print(f"  ✓ 从 data-src-zoom-image 直接获取 {len(images)} 张高清主图")
     except Exception as e:
+        if _is_browser_disconnected(e):
+            raise
         print(f"  方法0失败: {e}")
 
     # 方法1: 画廊区域 CSS 选择器
@@ -284,7 +306,9 @@ def _extract_product_images(driver) -> List[str]:
                 if images:
                     print(f"  ✓ 从画廊区域找到 {len(images)} 张主图")
                     break
-            except Exception:
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    raise
                 continue
 
     # 方法2: JavaScript 从页面图片容器提取
@@ -333,6 +357,8 @@ def _extract_product_images(driver) -> List[str]:
                         images.append(src)
                 print(f"  ✓ 通过JS从图片区域找到 {len(images)} 张主图")
         except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
             print(f"  JS提取失败: {e}")
 
     # 方法3: 按位置过滤（页面上半部分的 Etsy 图片）
@@ -352,11 +378,15 @@ def _extract_product_images(driver) -> List[str]:
                                 if img_id and img_id not in seen_ids:
                                     seen_ids.add(img_id)
                                     images.append(convert_to_fullsize(src))
-                        except Exception:
+                        except Exception as e:
+                            if _is_browser_disconnected(e):
+                                raise
                             pass
                 if images:
                     print(f"  ✓ 通过位置过滤找到 {len(images)} 张主图")
-        except Exception:
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
             pass
 
     result = list(dict.fromkeys(images))[:15]
@@ -465,6 +495,8 @@ def extract_data_with_selenium(driver) -> Optional[Dict]:
         return data
 
     except Exception as e:
+        if _is_browser_disconnected(e):
+            raise
         print(f"  ✗ 提取失败: {e}")
         return None
 
@@ -638,10 +670,18 @@ def main():
                     ctx.driver.execute_script("window.scrollTo(0, 0)")
                     time.sleep(1)
                 except Exception as e:
-                    print(f"  ❌ 导航失败: {e}")
-                    fail_count += 1
-                    consecutive_fails += 1
-                    continue
+                    if _is_browser_disconnected(e):
+                        print("  🔌 Chrome 连接断开，立即重启后重试...")
+                        if ctx.handle_block(url, immediate=True):
+                            consecutive_fails = 0
+                        else:
+                            print("❌ 无法恢复，停止")
+                            break
+                    else:
+                        print(f"  ❌ 导航失败: {e}")
+                        fail_count += 1
+                        consecutive_fails += 1
+                        continue
 
             # 封锁检测
             if _is_access_blocked(ctx.driver):
@@ -651,7 +691,23 @@ def main():
                     print("❌ 无法恢复，停止")
                     break
 
-            result = extract_data_with_selenium(ctx.driver)
+            try:
+                result = extract_data_with_selenium(ctx.driver)
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    print("  🔌 Chrome 连接断开，立即重启后重试当前链接...")
+                    if ctx.handle_block(url, immediate=True):
+                        try:
+                            result = extract_data_with_selenium(ctx.driver)
+                        except Exception as retry_error:
+                            print(f"  ❌ 重试仍失败: {retry_error}")
+                            result = None
+                    else:
+                        print("❌ 无法恢复，停止")
+                        break
+                else:
+                    print(f"  ❌ 提取失败: {e}")
+                    result = None
 
             if not result or not result.get('title'):
                 print(f"\n❌ 抓取失败！")
