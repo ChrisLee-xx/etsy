@@ -135,14 +135,8 @@ def get_random_ua() -> str:
 def _is_access_blocked(driver) -> bool:
     """检测当前页面是否触发了 Etsy 的访问限制"""
     try:
-        url = driver.current_url.lower()
-        if 'captcha' in url or 'datadome' in url or 'geo.captcha-delivery' in url:
-            return True
-        title = driver.title.lower()
-        if 'robot' in title or 'captcha' in title or 'restricted' in title:
-            return True
         page_source = driver.page_source
-        if '访问暂时受限' in page_source or 'temporarily restricted' in page_source.lower():
+        if '访问暂时受限' in page_source:
             return True
     except Exception:
         pass
@@ -208,39 +202,81 @@ class _DriverContext:
         self.chrome_process = chrome_process
         self.port = port
 
-    def handle_block(self, url: str, immediate: bool = False) -> bool:
+    def handle_block(self, url: str, section_url: str = None, immediate: bool = False) -> bool:
         """
-        检测到封锁后自动重启 Chrome。
-        等待冷却后重启，最多尝试 3 次。
-        如果是 Chrome/DevTools 断连，immediate=True 会立即重启第一次。
+        检测到封锁后恢复浏览，最多尝试 3 次。
+        
+        轻量恢复策略（不断开 Chrome）：
+        1. 等待 10 秒冷却
+        2. 访问 Etsy 首页（https://www.etsy.com/）
+        3. 等待 5 秒
+        4. 回到 section 页面
+        5. 检查是否仍被限制
+        
+        如果 Chrome/DevTools 断连，回退到完整重启。
+        
+        Args:
+            url: 当前正在访问的 URL（用于断连重启后导航）
+            section_url: Section 页面 URL（轻量恢复时回到此页面）
+            immediate: 是否跳过第一次等待（用于断连场景）
         """
         for attempt in range(1, 4):
-            cooldown = 0 if immediate and attempt == 1 else 30 * attempt
-            if cooldown > 0:
-                print(f"    🚫 访问被限制，等待 {cooldown} 秒后重启 Chrome（第 {attempt} 次）...")
-                time.sleep(cooldown)
-            else:
-                print(f"    🔌 Chrome 连接已断开，立即重启 Chrome（第 {attempt} 次）...")
-
-            new_chrome, new_driver = _restart_chrome_fresh(
-                self.chrome_process, url, self.port
-            )
-            if not new_driver:
-                continue
-
-            self.chrome_process = new_chrome
-            self.driver = new_driver
-
             try:
-                self.driver.get(url)
-                time.sleep(random.uniform(3, 5))
-            except Exception:
+                cooldown = 0 if immediate and attempt == 1 else 5
+                if cooldown > 0:
+                    print(f"    🚫 访问被限制，等待 {cooldown} 秒后恢复（第 {attempt} 次）...")
+                    time.sleep(cooldown)
+                else:
+                    print(f"    🚫 立即尝试恢复（第 {attempt} 次）...")
+                
+                # 步骤1：访问 Etsy 首页（最多重试 3 次）
+                home_ok = False
+                for home_attempt in range(1, 4):
+                    try:
+                        self.driver.get("https://www.etsy.com/")
+                        time.sleep(5)
+                        if not _is_access_blocked(self.driver):
+                            home_ok = True
+                            break
+                        print(f"    ⚠️ 首页仍被限制，重试第 {home_attempt} 次...")
+                    except Exception:
+                        print(f"    ⚠️ 访问首页失败，重试第 {home_attempt} 次...")
+                
+                if not home_ok:
+                    print(f"    ⚠️ 首页未能恢复，继续尝试...")
+                    continue
+                
+                # 步骤2：回到 section 页面
+                if section_url:
+                    self.driver.get(section_url)
+                    time.sleep(2)
+                
+                # 检查是否仍被限制
+                if not _is_access_blocked(self.driver):
+                    return True
+                    
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    # Chrome 断连，需要完整重启
+                    print(f"    🔌 Chrome 连接断开，重启 Chrome（第 {attempt} 次）...")
+                    new_chrome, new_driver = _restart_chrome_fresh(
+                        self.chrome_process, url, self.port
+                    )
+                    if not new_driver:
+                        continue
+                    self.chrome_process = new_chrome
+                    self.driver = new_driver
+                    try:
+                        nav_url = section_url or url
+                        self.driver.get(nav_url)
+                        time.sleep(random.uniform(3, 5))
+                    except Exception:
+                        continue
+                    if not _is_access_blocked(self.driver):
+                        return True
                 continue
-
-            if not _is_access_blocked(self.driver):
-                return True
-
-        print("    ❌ 多次重启仍被限制")
+        
+        print("    ❌ 多次恢复仍被限制")
         return False
 
 
@@ -442,27 +478,17 @@ def extract_data_with_selenium(driver) -> Optional[Dict]:
             print("⚠️  未检测到产品页面元素，跳过")
             return None
 
-        # 模拟人类滚动
-        print("模拟浏览行为...")
-        for _ in range(3):
-            scroll_distance = random.randint(200, 500)
-            driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-            time.sleep(random.uniform(0.5, 1.5))
-
-        driver.execute_script("window.scrollTo(0, 0)")
-        time.sleep(1)
-
         print("提取数据...")
         data = {}
 
         # 标题
         try:
             title_el = driver.find_element(By.CSS_SELECTOR, 'h1[data-buy-box-listing-title="true"]')
-            data['title'] = title_el.text.strip()
+            data['title'] = title_el.get_attribute('textContent').strip()
         except Exception:
             try:
                 title_el = driver.find_element(By.TAG_NAME, 'h1')
-                data['title'] = title_el.text.strip()
+                data['title'] = title_el.get_attribute('textContent').strip()
             except Exception:
                 data['title'] = None
 

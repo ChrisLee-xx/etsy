@@ -649,9 +649,9 @@ def download_images_to_section(
 
 def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
                     image_selection: List[int] = None, filter_words: List[str] = None,
-                    retry_on_disconnect: bool = True) -> bool:
+                    retry_on_disconnect: bool = True, section_url: str = None) -> bool:
     """
-    处理单个商品：导航、提取数据、下载图片
+    处理单个商品：从 section 页面导航到商品、提取数据、下载图片、回到 section 页面
 
     Args:
         ctx: _DriverContext（包含 driver 和 chrome_process，封锁时可自动重启）
@@ -660,6 +660,8 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
         name_tracker: 文件名跟踪器
         image_selection: 要下载的图片序号列表
         filter_words: 标题过滤词列表
+        retry_on_disconnect: 断连后是否重试
+        section_url: Section 页面 URL（用于回到 section 页面和封锁恢复）
 
     Returns:
         是否成功处理
@@ -667,12 +669,18 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
     product_url = f"https://www.etsy.com/listing/{listing_id}"
 
     try:
+        # 从 section 页面导航到商品页面
         ctx.driver.get(product_url)
         time.sleep(random.uniform(2, 4))
 
-        # 兜底：检测访问限制 → 自动清 profile 重启 Chrome
+        # 兜底：检测访问限制 → 轻量恢复后重新访问商品
         if _is_access_blocked(ctx.driver):
-            if not ctx.handle_block(product_url):
+            if not ctx.handle_block(product_url, section_url=section_url):
+                return False
+            # 恢复成功后（已在 section 页面），重新导航到商品
+            ctx.driver.get(product_url)
+            time.sleep(random.uniform(2, 4))
+            if _is_access_blocked(ctx.driver):
                 return False
 
         data = extract_product_data_silent(ctx.driver)
@@ -701,7 +709,7 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
     except Exception as e:
         if _is_browser_disconnected(e) and retry_on_disconnect:
             print(f"    🔌 Chrome 连接断开，重启后重试当前商品...")
-            if ctx.handle_block(product_url, immediate=True):
+            if ctx.handle_block(product_url, section_url=section_url, immediate=True):
                 return process_product(
                     ctx,
                     listing_id,
@@ -710,9 +718,19 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
                     image_selection=image_selection,
                     filter_words=filter_words,
                     retry_on_disconnect=False,
+                    section_url=section_url,
                 )
         print(f"    ✗ 处理失败: {e}")
         return False
+
+    finally:
+        # 无论成功或失败，都回到 section 页面
+        if section_url:
+            try:
+                ctx.driver.get(section_url)
+                time.sleep(2)
+            except Exception:
+                pass
 
 
 def extract_product_data_silent(driver) -> Optional[Dict]:
@@ -724,22 +742,14 @@ def extract_product_data_silent(driver) -> Optional[Dict]:
 
     data = {}
 
-    # 模拟人类滚动
-    for _ in range(2):
-        scroll_distance = random.randint(200, 400)
-        driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-        time.sleep(random.uniform(0.3, 0.8))
-    driver.execute_script("window.scrollTo(0, 0)")
-    time.sleep(0.5)
-
     # 提取标题
     try:
         title_el = driver.find_element(By.CSS_SELECTOR, 'h1[data-buy-box-listing-title="true"]')
-        data['title'] = title_el.text.strip()
+        data['title'] = title_el.get_attribute('textContent').strip()
     except Exception:
         try:
             title_el = driver.find_element(By.TAG_NAME, 'h1')
-            data['title'] = title_el.text.strip()
+            data['title'] = title_el.get_attribute('textContent').strip()
         except Exception:
             data['title'] = None
 
@@ -756,7 +766,8 @@ def process_all_products(
     delay: float = 2.0,
     image_selection: List[int] = None,
     filter_words: List[str] = None,
-    progress: ScrapeProgress = None
+    progress: ScrapeProgress = None,
+    section_url: str = None
 ) -> Tuple[int, int]:
     """
     批量处理所有商品
@@ -769,6 +780,7 @@ def process_all_products(
         image_selection: 要下载的图片序号列表
         filter_words: 标题过滤词列表
         progress: 进度管理器（可选）
+        section_url: Section 页面 URL（用于回到 section 页面和封锁恢复）
         
     Returns:
         Tuple[成功数, 失败数]
@@ -792,7 +804,8 @@ def process_all_products(
         print(f"\n[{i}/{total}] 商品 ID: {listing_id}")
         
         if process_product(ctx, listing_id, output_dir, name_tracker,
-                          image_selection=image_selection, filter_words=filter_words):
+                          image_selection=image_selection, filter_words=filter_words,
+                          section_url=section_url):
             success_count += 1
             consecutive_fails = 0
             if progress:
@@ -805,7 +818,7 @@ def process_all_products(
             if consecutive_fails >= max_consecutive_fails:
                 product_url = f"https://www.etsy.com/listing/{listing_id}"
                 print(f"\n    ⚠️ 连续 {consecutive_fails} 个商品失败，疑似被封锁，尝试重启 Chrome...")
-                if ctx.handle_block(product_url):
+                if ctx.handle_block(product_url, section_url=section_url):
                     print(f"    ✅ 已恢复，继续抓取")
                     consecutive_fails = 0
                 else:
@@ -1008,7 +1021,7 @@ def main():
                     time.sleep(1)
                 except Exception as e:
                     print(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")
-                    if ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                    if ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
                         print("  ✅ 已恢复")
                     else:
                         print("  ❌ 无法恢复，跳过此 Section")
@@ -1020,7 +1033,7 @@ def main():
                 section_name, total_items = get_section_info(ctx.driver, section_id)
             except Exception as e:
                 print(f"  ❌ 获取 Section 信息失败: {e}，尝试重启 Chrome...")
-                if ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                if ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
                     print("  ✅ 已恢复，重试...")
                     try:
                         section_name, total_items = get_section_info(ctx.driver, section_id)
@@ -1078,7 +1091,7 @@ def main():
                 listing_ids = extract_product_links(ctx.driver, url, total_items=total_items)
             except Exception as e:
                 print(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
-                if ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                if ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
                     print("  ✅ 已恢复，重试...")
                     try:
                         listing_ids = extract_product_links(ctx.driver, url, total_items=total_items)
@@ -1123,7 +1136,8 @@ def main():
                 delay=args.delay,
                 image_selection=image_selection,
                 filter_words=filter_words,
-                progress=progress
+                progress=progress,
+                section_url=url
             )
             
             total_success += success

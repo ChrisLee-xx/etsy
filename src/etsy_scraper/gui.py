@@ -295,7 +295,7 @@ class ScraperWorker:
 
                 if consecutive_fails >= 3:
                     self.log(f"\n⚠️ 连续 {consecutive_fails} 次失败，尝试重启 Chrome...")
-                    if self.ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                    if self.ctx.handle_block(url):
                         self.log("✅ 已恢复，继续")
                         consecutive_fails = 0
                     else:
@@ -359,7 +359,7 @@ class ScraperWorker:
                     time.sleep(2)
                 except Exception as e:
                     self.log(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")
-                    if self.ctx.handle_block(url):
+                    if self.ctx.handle_block(url, section_url=url):
                         self.driver = self.ctx.driver
                         self.chrome_process = self.ctx.chrome_process
                         self.log("  ✅ 已恢复")
@@ -372,7 +372,7 @@ class ScraperWorker:
                 section_name, total_items = get_section_info(self.ctx.driver, section_id)
             except Exception as e:
                 self.log(f"  ❌ 获取 Section 信息失败: {e}，尝试重启 Chrome...")
-                if self.ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
                     self.driver = self.ctx.driver
                     self.chrome_process = self.ctx.chrome_process
                     self.log("  ✅ 已恢复，重试...")
@@ -423,7 +423,7 @@ class ScraperWorker:
                                                      stop_check=lambda: self._stop_flag)
             except Exception as e:
                 self.log(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
-                if self.ctx.handle_block(url, immediate=_is_browser_disconnected(e)):
+                if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
                     self.driver = self.ctx.driver
                     self.chrome_process = self.ctx.chrome_process
                     self.log("  ✅ 已恢复，重试...")
@@ -462,7 +462,8 @@ class ScraperWorker:
                 
                 if process_product(self.ctx, listing_id, output_path, name_tracker,
                                   image_selection=self.image_selection,
-                                  filter_words=self.filter_words):
+                                  filter_words=self.filter_words,
+                                  section_url=url):
                     total_success += 1
                     consecutive_fails = 0
                     progress.save(listing_id)
@@ -475,7 +476,7 @@ class ScraperWorker:
                     if consecutive_fails >= 3:
                         product_url = f"https://www.etsy.com/listing/{listing_id}"
                         self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁，自动重启 Chrome...")
-                        if self.ctx.handle_block(product_url):
+                        if self.ctx.handle_block(product_url, section_url=url):
                             self.log("✅ 已恢复，继续抓取")
                             consecutive_fails = 0
                         else:
