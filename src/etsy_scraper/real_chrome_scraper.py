@@ -166,6 +166,7 @@ def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
     """
     print("\n    🔄 自动重启 Chrome（清理旧 session）...")
 
+    # 终止旧 Chrome 进程
     if chrome_process:
         try:
             chrome_process.terminate()
@@ -175,7 +176,19 @@ def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
                 chrome_process.kill()
             except Exception:
                 pass
-    time.sleep(2)
+
+    # 等待端口释放
+    time.sleep(3)
+
+    # 强制清理可能残留的占用端口的进程（仅 macOS）
+    import platform as _plat
+    if _plat.system() == 'Darwin':
+        try:
+            import subprocess as _sp
+            _sp.run(['fuser', '-k', f'{port}/tcp'], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        time.sleep(2)
 
     profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
     if profile_dir.exists():
@@ -186,11 +199,19 @@ def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
             pass
 
     new_chrome = start_chrome_with_debug(url, port)
-    if not wait_for_chrome_ready(port):
-        print("    ❌ Chrome 重启失败")
+    if not wait_for_chrome_ready(port, timeout=20):
+        print("    ❌ Chrome 重启失败（等待超时）")
         return None, None
 
     new_driver = create_patched_driver(port)
+
+    # 给新 driver 设置超时
+    try:
+        new_driver.set_page_load_timeout(30)
+        new_driver.set_script_timeout(15)
+    except Exception:
+        pass
+
     print("    ✅ Chrome 已重启，全新 session")
     return new_chrome, new_driver
 
@@ -201,14 +222,20 @@ class _DriverContext:
         self.driver = driver
         self.chrome_process = chrome_process
         self.port = port
+        # 设置超时防止无限卡死：页面加载 30s，脚本执行 15s，隐式等待 10s
+        try:
+            driver.set_page_load_timeout(30)
+            driver.set_script_timeout(15)
+        except Exception:
+            pass
 
     def handle_block(self, url: str, section_url: str = None, immediate: bool = False) -> bool:
         """
         检测到封锁后恢复浏览，最多尝试 3 次。
         
         轻量恢复策略（不断开 Chrome）：
-        1. 等待 10 秒冷却
-        2. 访问 Etsy 首页（https://www.etsy.com/）
+        1. 等待 5 秒冷却
+        2. 访问 Etsy 首页（https://www.etsy.com/），最多重试 3 次
         3. 等待 5 秒
         4. 回到 section 页面
         5. 检查是否仍被限制
@@ -467,8 +494,8 @@ def extract_data_with_selenium(driver) -> Optional[Dict]:
             if '/listing/' in current_url:
                 try:
                     h1 = driver.find_element(By.TAG_NAME, 'h1')
-                    h1_text = h1.text.strip()
-                    if h1_text and len(h1_text) > 5 and '验证' not in h1_text and 'robot' not in h1_text.lower():
+                    h1_text = h1.get_attribute('textContent').strip()
+                    if h1_text and len(h1_text) > 5 and '验证' not in h1_text:
                         is_product_page = True
                         print(f"✓ 检测到产品标题: {h1_text[:50]}...")
                 except Exception:
@@ -689,12 +716,6 @@ def main():
                 try:
                     ctx.driver.get(url)
                     time.sleep(2)
-                    for _ in range(2):
-                        scroll_distance = random.randint(200, 400)
-                        ctx.driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-                        time.sleep(random.uniform(0.3, 0.8))
-                    ctx.driver.execute_script("window.scrollTo(0, 0)")
-                    time.sleep(1)
                 except Exception as e:
                     if _is_browser_disconnected(e):
                         print("  🔌 Chrome 连接断开，立即重启后重试...")

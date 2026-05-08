@@ -11,7 +11,7 @@ from pathlib import Path
 
 # Project info
 APP_NAME = "EtsyScraper"
-APP_VERSION = "1.0.0"
+APP_VERSION = "0.1.0"
 
 # Project root
 PROJECT_ROOT = Path(__file__).parent.absolute()

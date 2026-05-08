@@ -1,7 +1,6 @@
 """
 Etsy Scraper GUI - CustomTkinter 桌面应用
 """
-import certifi
 import json
 import os
 import random

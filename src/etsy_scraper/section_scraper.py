@@ -666,31 +666,51 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
     Returns:
         是否成功处理
     """
+    import time as _time
     product_url = f"https://www.etsy.com/listing/{listing_id}"
+    t_start = _time.time()
 
     try:
-        # 从 section 页面导航到商品页面
+        # 步骤1：从 section 页面导航到商品页面
+        print(f"    → 导航到商品页...")
+        t1 = _time.time()
         ctx.driver.get(product_url)
-        time.sleep(random.uniform(2, 4))
+        nav_elapsed = _time.time() - t1
+        print(f"    → 导航完成 ({nav_elapsed:.1f}s)")
 
-        # 兜底：检测访问限制 → 轻量恢复后重新访问商品
+        wait_time = random.uniform(2, 4)
+        time.sleep(wait_time)
+
+        # 步骤2：检测访问限制 → 轻量恢复后重新访问商品
         if _is_access_blocked(ctx.driver):
+            print(f"    ⚠️ 检测到访问被限制，尝试恢复...")
             if not ctx.handle_block(product_url, section_url=section_url):
+                print(f"    ❌ 封锁恢复失败")
                 return False
             # 恢复成功后（已在 section 页面），重新导航到商品
+            print(f"    → 重新导航到商品页...")
             ctx.driver.get(product_url)
             time.sleep(random.uniform(2, 4))
             if _is_access_blocked(ctx.driver):
+                print(f"    ❌ 恢复后仍被限制")
                 return False
 
+        # 步骤3：提取商品数据
+        print(f"    → 提取商品数据...")
+        t2 = _time.time()
         data = extract_product_data_silent(ctx.driver)
+        extract_elapsed = _time.time() - t2
+        print(f"    → 数据提取完成 ({extract_elapsed:.1f}s)")
 
         if not data or not data.get('title'):
-            print(f"    ⚠️ 无法提取商品数据")
+            print(f"    ⚠️ 无法提取商品数据 (title={data.get('title') if data else None})")
             return False
 
+        # 步骤4：下载图片
         images = data.get('images', [])
         if images:
+            print(f"    → 找到 {len(images)} 张图片，开始下载...")
+            t3 = _time.time()
             downloaded = download_images_to_section(
                 images,
                 data['title'],
@@ -699,16 +719,25 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
                 image_selection=image_selection,
                 filter_words=filter_words
             )
+            dl_elapsed = _time.time() - t3
             total_to_download = len(image_selection) if image_selection else len(images)
-            print(f"    → 下载了 {downloaded}/{total_to_download} 张图片")
-            return downloaded > 0
+            print(f"    → 下载完成: {downloaded}/{total_to_download} 张 ({dl_elapsed:.1f}s)")
+            if downloaded > 0:
+                total_elapsed = _time.time() - t_start
+                print(f"    ✅ 总耗时 {total_elapsed:.1f}s")
+                return True
+            else:
+                print(f"    ⚠️ 所有图片下载均失败")
+                return False
         else:
             print(f"    ⚠️ 没有找到图片")
             return False
 
     except Exception as e:
+        elapsed = _time.time() - t_start
+        err_type = type(e).__name__
         if _is_browser_disconnected(e) and retry_on_disconnect:
-            print(f"    🔌 Chrome 连接断开，重启后重试当前商品...")
+            print(f"    🔌 Chrome 连接断开 ({err_type}: {e})，重启后重试当前商品...")
             if ctx.handle_block(product_url, section_url=section_url, immediate=True):
                 return process_product(
                     ctx,
@@ -720,7 +749,7 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
                     retry_on_disconnect=False,
                     section_url=section_url,
                 )
-        print(f"    ✗ 处理失败: {e}")
+        print(f"    ✗ 处理失败 [{err_type}] ({elapsed:.1f}s): {e}")
         return False
 
     finally:
