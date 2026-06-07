@@ -65,9 +65,19 @@ def start_chrome_with_debug(url: str, port: int = 9222) -> subprocess.Popen:
         f"--user-data-dir={temp_user_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        # 反检测核心：禁用 Blink 自动化特性开关（最关键的 webdriver 标识）
         "--disable-blink-features=AutomationControlled",
+        # 反检测：禁用启用自动化条（顶部黄色提示条"Chrome is being controlled by automated test software"）
+        "--disable-infobars",
+        # 反检测：禁用 Selenium / Puppeteer 等特征
+        "--disable-features=AutomationControlled,IsolateOrigins,site-per-process,TranslateUI",
+        # 反检测：禁用保存密码等可能暴露自动化的弹窗
+        "--password-store=basic",
+        "--use-mock-keychain",
+        # 窗口尺寸随机化（避免固定尺寸指纹）
         f"--window-size={random.randint(1200, 1920)},{random.randint(800, 1080)}",
-        url
+        # 启动时导航到 about:blank（不要带原始 URL，避免被 Etsy 标记首次访问路径）
+        "about:blank"
     ]
 
     return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -114,7 +124,17 @@ def create_patched_driver(port: int = 9222):
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
     service = Service(executable_path=patcher.executable_path)
-    return webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(service=service, options=options)
+
+    # 反检测：注入 JS 隐藏 webdriver 痕迹 + 设置随机 UA
+    try:
+        ua = get_random_ua()
+        driver.execute_cdp_cmd("Network.setUserAgentOverride", {"userAgent": ua})
+    except Exception:
+        pass
+    apply_stealth(driver)
+
+    return driver
 
 
 USER_AGENTS = [
@@ -128,6 +148,78 @@ USER_AGENTS = [
 
 def get_random_ua() -> str:
     return random.choice(USER_AGENTS)
+
+
+# 反检测：注入 JS 隐藏 Selenium / WebDriver 痕迹
+# 这是 Etsy DataDome 等反爬系统的核心检查点
+STEALTH_JS = """
+// 1. 隐藏 webdriver 标志
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+// 2. 修复 chrome.runtime（headless 模式下为空，触发检测）
+if (window.chrome && !window.chrome.runtime) {
+    window.chrome.runtime = {
+        PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+        PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+        RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update', UPDATE_AVAILABLE: 'update_available' },
+        OnInstalledReason: { CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update', INSTALL: 'install' },
+        OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+        connect: function() { return Promise.resolve({}); },
+        sendMessage: function() { return Promise.resolve(); }
+    };
+}
+
+// 3. 伪造 plugins 列表（headless 默认空数组是机器人特征）
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [
+        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+    ]
+});
+
+// 4. 伪造 languages（默认只 en-US，正常用户多语种）
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en', 'zh-CN', 'zh']
+});
+
+// 5. 修复 permissions API（headless 下 notifications 行为异常）
+const originalQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (parameters) => (
+    parameters.name === 'notifications' ?
+        Promise.resolve({ state: Notification.permission }) :
+        originalQuery(parameters)
+);
+"""
+
+
+def apply_stealth(driver):
+    """
+    在每个新建的 driver 上注入反检测 JS。
+    必须在每个新页签加载前调用一次（set_page_load_timeout 不影响）。
+    """
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": STEALTH_JS}
+        )
+    except Exception as e:
+        print(f"  ⚠️ 反检测注入失败: {e}")
+
+
+# 拟人化延迟：基础延迟 + 随机抖动 + 偶发长间隔（模拟人类分心/喝水）
+def human_like_delay(base: float = 2.0, jitter: float = 1.5, long_pause_chance: float = 0.08, long_pause_range: tuple = (5, 12)) -> float:
+    """
+    生成拟人化等待时间：
+    - 基础延迟 base
+    - 上下抖动 jitter（±jitter 秒）
+    - 8% 概率触发长间隔（5-12 秒，模拟人类分心）
+    """
+    delay = base + random.uniform(-jitter, jitter)
+    delay = max(0.5, delay)
+    if random.random() < long_pause_chance:
+        delay += random.uniform(*long_pause_range)
+    return delay
 
 
 # ────────────── 封锁检测与自动恢复 ──────────────
@@ -205,12 +297,13 @@ def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
 
     new_driver = create_patched_driver(port)
 
-    # 给新 driver 设置超时
+    # 给新 driver 设置超时 + 反检测（create_patched_driver 已注入，此处再确认一次）
     try:
         new_driver.set_page_load_timeout(30)
         new_driver.set_script_timeout(15)
     except Exception:
         pass
+    apply_stealth(new_driver)
 
     print("    ✅ Chrome 已重启，全新 session")
     return new_chrome, new_driver
@@ -712,23 +805,23 @@ def main():
                 print(f"  {url}")
                 print(f"{'='*60}")
 
-            if idx > 1:
-                try:
-                    ctx.driver.get(url)
-                    time.sleep(2)
-                except Exception as e:
-                    if _is_browser_disconnected(e):
-                        print("  🔌 Chrome 连接断开，立即重启后重试...")
-                        if ctx.handle_block(url, immediate=True):
-                            consecutive_fails = 0
-                        else:
-                            print("❌ 无法恢复，停止")
-                            break
+            # 每个 URL 都重新导航（Chrome 启动时只开 about:blank）
+            try:
+                ctx.driver.get(url)
+                time.sleep(human_like_delay(base=2.0, jitter=0.8))
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    print("  🔌 Chrome 连接断开，立即重启后重试...")
+                    if ctx.handle_block(url, immediate=True):
+                        consecutive_fails = 0
                     else:
-                        print(f"  ❌ 导航失败: {e}")
-                        fail_count += 1
-                        consecutive_fails += 1
-                        continue
+                        print("❌ 无法恢复，停止")
+                        break
+                else:
+                    print(f"  ❌ 导航失败: {e}")
+                    fail_count += 1
+                    consecutive_fails += 1
+                    continue
 
             # 封锁检测
             if _is_access_blocked(ctx.driver):
@@ -793,8 +886,7 @@ def main():
                             image_selection=image_selection, filter_words=filter_words)
 
             if idx < total_urls:
-                wait_time = args.delay + random.uniform(-0.5, 1.0)
-                wait_time = max(1.0, wait_time)
+                wait_time = human_like_delay(base=args.delay, jitter=1.0)
                 print(f"\n⏳ 等待 {wait_time:.1f} 秒后处理下一个链接...")
                 time.sleep(wait_time)
 
