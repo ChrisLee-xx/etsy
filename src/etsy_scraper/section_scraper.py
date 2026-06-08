@@ -167,7 +167,6 @@ try:
         _restart_chrome_fresh,
         _DriverContext,
         _extract_product_images,
-        human_like_delay,
     )
 except ImportError:
     from real_chrome_scraper import (
@@ -182,7 +181,6 @@ except ImportError:
         _restart_chrome_fresh,
         _DriverContext,
         _extract_product_images,
-        human_like_delay,
     )
 
 
@@ -299,11 +297,6 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
             print("  → 收到停止信号，停止翻页")
             break
 
-        # 硬性保护：累计已达 200 页强制退出（6929 件×2 余量也才 150 页）
-        if current_page > 200:
-            print(f"  → 达到 200 页硬上限，强制停止翻页")
-            break
-
         # 构造当前页 URL
         page_url = build_page_url(section_url, current_page)
         
@@ -312,10 +305,11 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         else:
             print(f"\n📄 正在处理第 {current_page} 页...")
         
-        # 导航到当前页（不再滚动：Etsy 列表页默认渲染所有商品卡，无需触发懒加载）
+        # 导航到当前页并滚动触发懒加载；Chrome 断连时向外抛出，交给上层重启恢复
         try:
             driver.get(page_url)
-            time.sleep(2)  # 等待页面加载
+            time.sleep(3)  # 等待页面加载
+            scroll_page(driver)
         except Exception as e:
             if _is_browser_disconnected(e):
                 raise
@@ -368,19 +362,32 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
                 break
         
         current_page += 1
-        time.sleep(human_like_delay(base=2.0, jitter=0.8))  # 翻页间延迟
+        time.sleep(2)  # 翻页间延迟
     
     return all_listing_ids
 
 
 def scroll_page(driver, scroll_times: int = 5):
     """
-    [已废弃] 滚动页面以触发懒加载
+    滚动页面以触发懒加载
     
-    根据用户要求：抓图过程取消模拟滑动。
-    此函数保留仅为兼容旧调用方，新代码请勿使用。
+    Args:
+        driver: Selenium WebDriver 实例
+        scroll_times: 滚动次数
     """
-    return  # 直接返回，不执行任何滚动
+    for i in range(scroll_times):
+        # 随机滚动距离
+        scroll_distance = random.randint(300, 600)
+        driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
+        time.sleep(random.uniform(0.3, 0.8))
+    
+    # 滚动到底部确保所有内容加载
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
+    
+    # 滚动回顶部
+    driver.execute_script("window.scrollTo(0, 0)")
+    time.sleep(0.5)
 
 
 def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
@@ -671,7 +678,7 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
         nav_elapsed = _time.time() - t1
         print(f"    → 导航完成 ({nav_elapsed:.1f}s)")
 
-        wait_time = human_like_delay(base=2.5, jitter=1.0)
+        wait_time = random.uniform(2, 4)
         time.sleep(wait_time)
 
         # 步骤2：检测访问限制 → 轻量恢复后重新访问商品
@@ -683,7 +690,7 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
             # 恢复成功后（已在 section 页面），重新导航到商品
             print(f"    → 重新导航到商品页...")
             ctx.driver.get(product_url)
-            time.sleep(human_like_delay(base=2.5, jitter=1.0))
+            time.sleep(random.uniform(2, 4))
             if _is_access_blocked(ctx.driver):
                 print(f"    ❌ 恢复后仍被限制")
                 return False
@@ -750,7 +757,7 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
         if section_url:
             try:
                 ctx.driver.get(section_url)
-                time.sleep(human_like_delay(base=1.5, jitter=0.5))
+                time.sleep(2)
             except Exception:
                 pass
 
@@ -848,7 +855,8 @@ def process_all_products(
                     break
         
         if i < total:
-            wait_time = human_like_delay(base=delay, jitter=1.0)
+            wait_time = delay + random.uniform(-0.5, 1.0)
+            wait_time = max(1.0, wait_time)
             print(f"    ⏳ 等待 {wait_time:.1f} 秒...")
             time.sleep(wait_time)
     
@@ -1033,8 +1041,13 @@ def main():
             if sec_idx > 1:
                 try:
                     ctx.driver.get(url)
-                    # 拟人化等待（基础+抖动+偶发长间隔），避免规律性访问
-                    time.sleep(human_like_delay(base=2.0, jitter=0.8))
+                    time.sleep(2)
+                    for _ in range(2):
+                        scroll_distance = random.randint(200, 400)
+                        ctx.driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
+                        time.sleep(random.uniform(0.3, 0.8))
+                    ctx.driver.execute_script("window.scrollTo(0, 0)")
+                    time.sleep(1)
                 except Exception as e:
                     print(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")
                     if ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
@@ -1168,7 +1181,8 @@ def main():
             
             # Section 间延迟
             if sec_idx < total_sections:
-                wait_time = human_like_delay(base=args.section_delay, jitter=1.0)
+                wait_time = args.section_delay + random.uniform(-0.5, 1.0)
+                wait_time = max(1.0, wait_time)
                 print(f"\n⏳ 等待 {wait_time:.1f} 秒后处理下一个 Section...")
                 time.sleep(wait_time)
         
