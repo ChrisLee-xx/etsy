@@ -272,6 +272,12 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
     2. 结合 total_items 计算总页数: ceil(total_items / items_per_page)
     3. 从第 2 页开始逐页构造 URL 访问
     
+    跨平台兼容性优化：
+    - 使用 WebDriverWait 替代固定 sleep，确保商品卡片 DOM 已渲染
+    - 多选择器回退机制，兼容不同版本的 Etsy 页面结构
+    - 页面就绪检测（readyState + scrollHeight 稳定检测）
+    - 卡片查找重试机制，解决 Windows 渲染延迟问题
+    
     Args:
         driver: Selenium WebDriver 实例
         section_url: Section 页面 URL
@@ -282,15 +288,91 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         商品 listing_id 列表
     """
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    
+    # 商品卡片的 CSS 选择器列表（按优先级排列，兼容不同 Etsy 页面版本）
+    CARD_SELECTORS = [
+        'div.v2-listing-card[data-listing-id]',
+        'div[data-listing-id]',
+        'a.listing-link[data-listing-id]',
+        'div.listing-card[data-listing-id]',
+    ]
     
     all_listing_ids = []
     seen_ids = set()
-    items_per_page = 0  # 从第一页动态获取
+    items_per_page = 0
     total_pages = None
     current_page = 1
     
     print(f"\n📊 Section 总商品数: {total_items}" if total_items > 0 else "\n📊 总商品数未知，将逐页探测")
     
+    # ----- 辅助函数：等待页面内容就绪 -----
+    def _wait_page_ready(timeout=15):
+        """等待页面渲染完成，返回 (ok, reason)。网络慢时延长等待并提示。"""
+        # 等待 readyState complete
+        ready_ok = False
+        try:
+            WebDriverWait(driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            ready_ok = True
+        except Exception:
+            pass
+        
+        if not ready_ok:
+            # readyState 超时 → 可能是网络慢，延长等待再试一次
+            print("    ⏳ 页面加载较慢（readyState 超时），延长等待 10 秒...")
+            try:
+                WebDriverWait(driver, 10).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                ready_ok = True
+            except Exception:
+                pass
+        
+        # 等待 body 有内容
+        try:
+            WebDriverWait(driver, timeout).until(
+                lambda d: d.execute_script("return document.body.scrollHeight") > 100
+            )
+        except Exception:
+            pass
+        
+        # 页面高度稳定检测
+        try:
+            prev_height = driver.execute_script("return document.body.scrollHeight")
+            for i in range(5):  # 从 3 轮增加到 5 轮（网络慢时懒加载需要更久）
+                time.sleep(1.5)
+                new_height = driver.execute_script("return document.body.scrollHeight")
+                if new_height == prev_height:
+                    break
+                prev_height = new_height
+                if i >= 2:  # 第 3 轮还不稳定，提示网络慢
+                    print(f"    ⏳ 页面仍在加载内容（ scrollHeight 持续变化），网络可能较慢...")
+        except Exception:
+            pass
+    
+    # ----- 辅助函数：提取当前页商品 ID -----
+    def _extract_page_ids():
+        """尝试多种选择器提取当前页的商品 listing_id"""
+        for selector in CARD_SELECTORS:
+            try:
+                cards = driver.find_elements(By.CSS_SELECTOR, selector)
+                if cards:
+                    ids = []
+                    for card in cards:
+                        lid = card.get_attribute('data-listing-id')
+                        if lid and lid not in seen_ids:
+                            ids.append(lid)
+                    if ids:
+                        return ids
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    raise
+                continue
+        return []
+    
+    # ----- 主翻页循环 -----
     while True:
         # 检查停止信号
         if stop_check and stop_check():
@@ -305,42 +387,82 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         else:
             print(f"\n📄 正在处理第 {current_page} 页...")
         
-        # 导航到当前页并滚动触发懒加载；Chrome 断连时向外抛出，交给上层重启恢复
+        # 导航到当前页（超时时自动重试一次，适应网络波动）
+        nav_ok = False
+        for nav_attempt in range(2):
+            try:
+                driver.get(page_url)
+                nav_ok = True
+                break
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    raise
+                if nav_attempt == 0:
+                    print(f"  ⏳ 页面加载超时（可能是网络较慢），等待 5 秒后重试...")
+                    time.sleep(5)
+                else:
+                    print(f"  ✗ 页面导航失败（已重试）: {e}")
+        if not nav_ok:
+            break
+        
+        # 等待页面内容渲染完成
+        _wait_page_ready()
+        
+        # 滚动页面触发懒加载
         try:
-            driver.get(page_url)
-            time.sleep(3)  # 等待页面加载
             scroll_page(driver)
         except Exception as e:
             if _is_browser_disconnected(e):
                 raise
-            print(f"  ✗ 页面加载失败: {e}")
+            print(f"  ✗ 页面滚动失败: {e}")
+        
+        # 提取当前页的商品 listing_id（带重试机制，解决 Windows 渲染延迟）
+        page_ids = []
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                page_ids = _extract_page_ids()
+                if page_ids:
+                    break
+                # 没找到卡片，等待渲染后再重试
+                if retry < max_retries - 1:
+                    print(f"  ⏳ 未找到商品卡片，等待页面渲染后重试 ({retry + 1}/{max_retries - 1})...")
+                    time.sleep(3)
+                    # 再次滚动以触发可能的延迟渲染
+                    try:
+                        driver.execute_script("window.scrollBy(0, 500)")
+                        time.sleep(1.5)
+                    except Exception:
+                        pass
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    raise
+                print(f"  ✗ 提取商品失败 (第{retry + 1}次): {e}")
+                if retry >= max_retries - 1:
+                    break
+                time.sleep(2)
+        
+        # 记录新发现的商品
+        for listing_id in page_ids:
+            if listing_id not in seen_ids:
+                seen_ids.add(listing_id)
+                all_listing_ids.append(listing_id)
+        
+        new_count = len(page_ids)
+        print(f"  ✓ 本页找到 {new_count} 个新商品")
+        
+        # 如果本页无新商品，停止翻页
+        if not page_ids:
+            if current_page == 1:
+                print("  → 第 1 页无商品卡片，请检查页面是否正常加载")
+            else:
+                print("  → 本页无新商品，停止翻页")
             break
         
-        # 提取当前页的商品 listing_id
-        try:
-            product_cards = driver.find_elements(
-                By.CSS_SELECTOR, 
-                'div.v2-listing-card[data-listing-id]'
-            )
-            
-            page_ids = []
-            for card in product_cards:
-                listing_id = card.get_attribute('data-listing-id')
-                if listing_id and listing_id not in seen_ids:
-                    seen_ids.add(listing_id)
-                    page_ids.append(listing_id)
-                    all_listing_ids.append(listing_id)
-            
-            print(f"  ✓ 本页找到 {len(page_ids)} 个新商品")
-            
-            # 如果本页无新商品，停止翻页
-            if not page_ids:
-                print("  → 本页无新商品，停止翻页")
-                break
-            
-            # 第一页抓取完成后，动态计算每页商品数和总页数
-            if current_page == 1 and total_items > 0:
-                items_per_page = len(page_ids)
+        # 第一页抓取完成后，动态计算每页商品数和总页数
+        if current_page == 1 and total_items > 0:
+            items_per_page = new_count
+            if items_per_page > 0:
                 total_pages = math.ceil(total_items / items_per_page)
                 print(f"  📊 每页 {items_per_page} 个商品，预计共 {total_pages} 页")
                 
@@ -348,12 +470,8 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
                 if total_pages <= 1:
                     print(f"  → 仅 1 页，无需翻页")
                     break
-            
-        except Exception as e:
-            if _is_browser_disconnected(e):
-                raise
-            print(f"  ✗ 提取商品失败: {e}")
-            break
+            else:
+                print(f"  ⚠️ 无法计算页数（每页商品数为 0），将逐页探测")
         
         # 检查是否已到达最后一页
         if total_pages is not None:
@@ -369,25 +487,66 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
 
 def scroll_page(driver, scroll_times: int = 5):
     """
-    滚动页面以触发懒加载
-    
-    Args:
-        driver: Selenium WebDriver 实例
-        scroll_times: 滚动次数
+    模拟真人滚动浏览行为：
+    - 不等距滚动（200-700px 随机），速度不恒定
+    - 偶尔"阅读停顿"（20% 概率静止 2-4 秒，模拟看商品）
+    - 偶尔回滚（15% 概率，模拟回看确认）
+    - 等待高度稳定后停在 70% 位置（保持卡片可见）
     """
+    try:
+        from .real_chrome_scraper import human_delay, human_mouse_move
+    except ImportError:
+        from real_chrome_scraper import human_delay, human_mouse_move
+    
+    # 等待就绪
+    try:
+        for _ in range(10):
+            ready = driver.execute_script("return document.readyState")
+            if ready == "complete":
+                break
+            time.sleep(0.5)
+    except Exception:
+        pass
+    
+    # 渐进式滚动（变速，带停顿和回滚）
     for i in range(scroll_times):
-        # 随机滚动距离
-        scroll_distance = random.randint(300, 600)
+        scroll_distance = random.randint(200, 700)
         driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-        time.sleep(random.uniform(0.3, 0.8))
+        human_delay(random.uniform(0.6, 1.5))
+        
+        # 偶尔"阅读停顿"（真人看商品时会停一下）
+        if random.random() < 0.2:
+            human_delay(random.uniform(2.0, 4.0))
+        
+        # 偶尔回滚（真人回看确认）
+        if random.random() < 0.15:
+            driver.execute_script(f"window.scrollBy(0, -{random.randint(50, 150)})")
+            human_delay(random.uniform(0.3, 0.8))
+        
+        # 偶尔移动鼠标（模拟浏览行为）
+        if random.random() < 0.3:
+            human_mouse_move(driver)
     
-    # 滚动到底部确保所有内容加载
+    # 滚到底部
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(1)
+    human_delay(2.0, 0.5)
     
-    # 滚动回顶部
-    driver.execute_script("window.scrollTo(0, 0)")
-    time.sleep(0.5)
+    # 等待高度稳定
+    try:
+        prev_height = driver.execute_script("return document.body.scrollHeight")
+        for _ in range(3):
+            human_delay(1.0, 0.2)
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            if new_height == prev_height:
+                break
+            prev_height = new_height
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+    except Exception:
+        pass
+    
+    # 停在 70% 位置
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.7)")
+    human_delay(1.0, 0.2)
 
 
 def get_section_info(driver, section_id: str = None) -> Tuple[str, int]:
@@ -641,125 +800,153 @@ def download_images_to_section(
         except Exception as e:
             print(f"    ✗ 图片 {idx} 下载失败: {e}")
         
-        # 短暂延迟
-        time.sleep(random.uniform(0.2, 0.5))
+        # 短暂延迟（高斯分布更像真人节奏）
+        try:
+            from .real_chrome_scraper import human_delay as _hd
+        except ImportError:
+            from real_chrome_scraper import human_delay as _hd
+        _hd(random.uniform(0.2, 0.5))
     
     return downloaded
 
 
 def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageNameTracker,
                     image_selection: List[int] = None, filter_words: List[str] = None,
-                    retry_on_disconnect: bool = True, section_url: str = None) -> bool:
+                    retry_on_disconnect: bool = True, section_url: str = None,
+                    log_cb=None, use_tabs: bool = False, _retry_count: int = 0) -> bool:
     """
-    处理单个商品：从 section 页面导航到商品、提取数据、下载图片、回到 section 页面
-
-    Args:
-        ctx: _DriverContext（包含 driver 和 chrome_process，封锁时可自动重启）
-        listing_id: 商品 ID
-        output_dir: 输出目录
-        name_tracker: 文件名跟踪器
-        image_selection: 要下载的图片序号列表
-        filter_words: 标题过滤词列表
-        retry_on_disconnect: 断连后是否重试
-        section_url: Section 页面 URL（用于回到 section 页面和封锁恢复）
-
-    Returns:
-        是否成功处理
+    处理单个商品
+    
+    use_tabs=False（默认）：driver.get() 直接导航，静默不抢焦点
+    use_tabs=True：新标签页打开（会切换窗口，影响正常使用）
     """
+    _log = log_cb if log_cb else print
+    MAX_RETRIES = 2
+    
+    if _retry_count >= MAX_RETRIES:
+        _log(f"    ❌ 已达最大重试次数 ({MAX_RETRIES})，放弃当前商品")
+        return False
     import time as _time
     product_url = f"https://www.etsy.com/listing/{listing_id}"
     t_start = _time.time()
 
+    # 记住当前的 Section tab 句柄（仅 tabs 模式需要）
+    section_tab = ctx.driver.current_window_handle if use_tabs else None
+    
+    def _cleanup_navigate_back():
+        """根据模式清理并回到 Section 页"""
+        if use_tabs:
+            # 关闭商品 Tab，切回 Section Tab
+            try:
+                ctx.driver.close()
+                ctx.driver.switch_to.window(section_tab)
+            except Exception:
+                pass
+        else:
+            # 直接导航回 Section 页
+            if section_url:
+                try:
+                    ctx.driver.get(section_url)
+                    time.sleep(2)
+                except Exception:
+                    pass
+    
     try:
-        # 步骤1：从 section 页面导航到商品页面
-        print(f"    → 导航到商品页...")
+        # 步骤1：打开商品页（根据模式选择方式）
         t1 = _time.time()
-        ctx.driver.get(product_url)
-        nav_elapsed = _time.time() - t1
-        print(f"    → 导航完成 ({nav_elapsed:.1f}s)")
-
-        wait_time = random.uniform(2, 4)
-        time.sleep(wait_time)
-
-        # 步骤2：检测访问限制 → 轻量恢复后重新访问商品
-        if _is_access_blocked(ctx.driver):
-            print(f"    ⚠️ 检测到访问被限制，尝试恢复...")
-            if not ctx.handle_block(product_url, section_url=section_url):
-                print(f"    ❌ 封锁恢复失败")
-                return False
-            # 恢复成功后（已在 section 页面），重新导航到商品
-            print(f"    → 重新导航到商品页...")
+        if use_tabs:
+            _log(f"    → 在新标签页打开商品...")
+            ctx.driver.switch_to.new_window('tab')
             ctx.driver.get(product_url)
-            time.sleep(random.uniform(2, 4))
-            if _is_access_blocked(ctx.driver):
-                print(f"    ❌ 恢复后仍被限制")
-                return False
+        else:
+            _log(f"    → 导航到商品页...")
+            ctx.driver.get(product_url)
+        
+        # 等待加载
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait as _Wdw
+            _Wdw(ctx.driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except Exception:
+            pass
+        
+        nav_elapsed = _time.time() - t1
+        _log(f"    → 商品页加载完成 ({nav_elapsed:.1f}s)")
+
+        # 随机延迟模拟浏览
+        try:
+            from .real_chrome_scraper import human_delay
+        except ImportError:
+            from real_chrome_scraper import human_delay
+        human_delay(random.uniform(2, 4), 1.0)
+
+        # 步骤2：检测访问限制
+        if _is_access_blocked(ctx.driver):
+            _log(f"    ⚠️ 商品页受限，关闭此 Tab 回到 Section...")
+            _cleanup_navigate_back()
+            # 在 Section 页触发封锁恢复
+            if ctx.handle_block(product_url, section_url=section_url):
+                _log(f"    ✅ 已恢复，重试当前商品")
+                return process_product(ctx, listing_id, output_dir, name_tracker,
+                                       image_selection=image_selection, filter_words=filter_words,
+                                       retry_on_disconnect=False, section_url=section_url,
+                                       log_cb=log_cb, _retry_count=_retry_count + 1, use_tabs=use_tabs)
+            return False
 
         # 步骤3：提取商品数据
-        print(f"    → 提取商品数据...")
+        _log(f"    → 提取商品数据...")
         t2 = _time.time()
         data = extract_product_data_silent(ctx.driver)
         extract_elapsed = _time.time() - t2
-        print(f"    → 数据提取完成 ({extract_elapsed:.1f}s)")
+        _log(f"    → 数据提取完成 ({extract_elapsed:.1f}s)")
 
         if not data or not data.get('title'):
-            print(f"    ⚠️ 无法提取商品数据 (title={data.get('title') if data else None})")
+            _log(f"    ⚠️ 无法提取商品数据")
+            _cleanup_navigate_back()
             return False
 
         # 步骤4：下载图片
         images = data.get('images', [])
         if images:
-            print(f"    → 找到 {len(images)} 张图片，开始下载...")
+            _log(f"    → 找到 {len(images)} 张图片，开始下载...")
             t3 = _time.time()
             downloaded = download_images_to_section(
-                images,
-                data['title'],
-                output_dir,
-                name_tracker,
-                image_selection=image_selection,
-                filter_words=filter_words
+                images, data['title'], output_dir, name_tracker,
+                image_selection=image_selection, filter_words=filter_words
             )
             dl_elapsed = _time.time() - t3
             total_to_download = len(image_selection) if image_selection else len(images)
-            print(f"    → 下载完成: {downloaded}/{total_to_download} 张 ({dl_elapsed:.1f}s)")
+            _log(f"    → 下载完成: {downloaded}/{total_to_download} 张 ({dl_elapsed:.1f}s)")
             if downloaded > 0:
                 total_elapsed = _time.time() - t_start
-                print(f"    ✅ 总耗时 {total_elapsed:.1f}s")
+                _log(f"    ✅ 总耗时 {total_elapsed:.1f}s")
+                _cleanup_navigate_back()
                 return True
             else:
-                print(f"    ⚠️ 所有图片下载均失败")
+                _log(f"    ⚠️ 所有图片下载均失败")
+                _cleanup_navigate_back()
                 return False
         else:
-            print(f"    ⚠️ 没有找到图片")
+            _log(f"    ⚠️ 没有找到图片")
+            _cleanup_navigate_back()
             return False
 
     except Exception as e:
         elapsed = _time.time() - t_start
         err_type = type(e).__name__
+        # 尝试回到 Section 页
+        _cleanup_navigate_back()
+        
         if _is_browser_disconnected(e) and retry_on_disconnect:
-            print(f"    🔌 Chrome 连接断开 ({err_type}: {e})，重启后重试当前商品...")
+            _log(f"    🔌 Chrome 连接断开 ({err_type})，重启后重试...")
             if ctx.handle_block(product_url, section_url=section_url, immediate=True):
-                return process_product(
-                    ctx,
-                    listing_id,
-                    output_dir,
-                    name_tracker,
-                    image_selection=image_selection,
-                    filter_words=filter_words,
-                    retry_on_disconnect=False,
-                    section_url=section_url,
-                )
-        print(f"    ✗ 处理失败 [{err_type}] ({elapsed:.1f}s): {e}")
+                return process_product(ctx, listing_id, output_dir, name_tracker,
+                                       image_selection=image_selection, filter_words=filter_words,
+                                       retry_on_disconnect=False, section_url=section_url,
+                                       log_cb=log_cb, _retry_count=_retry_count + 1, use_tabs=use_tabs)
+        _log(f"    ✗ 处理失败 [{err_type}] ({elapsed:.1f}s): {e}")
         return False
-
-    finally:
-        # 无论成功或失败，都回到 section 页面
-        if section_url:
-            try:
-                ctx.driver.get(section_url)
-                time.sleep(2)
-            except Exception:
-                pass
 
 
 def extract_product_data_silent(driver) -> Optional[Dict]:
@@ -1016,8 +1203,15 @@ def main():
     driver = create_patched_driver(args.port)
     ctx = _DriverContext(driver, chrome_process, args.port)
     
-    # 等待页面加载
-    time.sleep(3)
+    # 等待页面加载（使用就绪检测代替固定等待，兼容 Windows 渲染延迟）
+    print("\n📌 等待页面就绪...")
+    try:
+        from selenium.webdriver.support.ui import WebDriverWait as _MainWdw
+        _MainWdw(ctx.driver, 20).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except Exception:
+        time.sleep(3)
     
     # 统计
     total_success = 0
@@ -1042,11 +1236,12 @@ def main():
                 try:
                     ctx.driver.get(url)
                     time.sleep(2)
-                    for _ in range(2):
-                        scroll_distance = random.randint(200, 400)
+                    # 渐进式滚动触发页面渲染，不滚回顶部
+                    for _ in range(3):
+                        scroll_distance = random.randint(300, 500)
                         ctx.driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
-                        time.sleep(random.uniform(0.3, 0.8))
-                    ctx.driver.execute_script("window.scrollTo(0, 0)")
+                        time.sleep(random.uniform(0.8, 1.5))
+                    ctx.driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.5)")
                     time.sleep(1)
                 except Exception as e:
                     print(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")

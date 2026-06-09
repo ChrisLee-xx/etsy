@@ -66,6 +66,15 @@ def start_chrome_with_debug(url: str, port: int = 9222) -> subprocess.Popen:
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-blink-features=AutomationControlled",
+        # 额外反检测参数（减少自动化痕迹）
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--disable-default-apps",
+        "--mute-audio",
+        "--no-service-autorun",
+        "--disable-component-update",
         f"--window-size={random.randint(1200, 1920)},{random.randint(800, 1080)}",
         url
     ]
@@ -130,13 +139,64 @@ def get_random_ua() -> str:
     return random.choice(USER_AGENTS)
 
 
+# ────────────── 人类行为模拟 ──────────────
+
+def human_delay(base_seconds: float, jitter: float = 0.5):
+    """
+    高斯分布延迟，比均匀分布更接近真人节奏。
+    - 大部分延迟集中在均值附近（正态分布）
+    - 极少出现极端快/慢值
+    - 截断范围: [base * 0.5, base * 2]
+    """
+    delay = random.gauss(base_seconds, jitter)
+    delay = max(base_seconds * 0.5, min(delay, base_seconds * 2))
+    time.sleep(delay)
+
+
+def human_mouse_move(driver, target_x: int = None, target_y: int = None):
+    """
+    模拟鼠标移动到页面绝对坐标位置（浏览行为，无点击）。
+    先定位到 body 原点，再偏移到目标坐标，避免相对位移歧义。
+    """
+    try:
+        from selenium.webdriver.common.action_chains import ActionChains
+        from selenium.webdriver.common.by import By
+        
+        if target_x is None:
+            target_x = random.randint(200, 800)
+        if target_y is None:
+            target_y = random.randint(150, 600)
+        
+        body = driver.find_element(By.TAG_NAME, 'body')
+        ActionChains(driver)\
+            .move_to_element_with_offset(body, 0, 0)\
+            .move_by_offset(target_x, target_y)\
+            .perform()
+    except Exception:
+        pass  # 静默失败，鼠标移动是锦上添花
+
+
 # ────────────── 封锁检测与自动恢复 ──────────────
 
 def _is_access_blocked(driver) -> bool:
-    """检测当前页面是否触发了 Etsy 的访问限制"""
+    """检测 Etsy 访问限制白屏（精准匹配两种已知文案）
+    
+    Etsy 白屏只有两种形式：
+    - 英文: "Access is temporarily limited" 或 "Access temporarily limited"
+    - 中文: "访问暂时受限"
+    
+    不用模糊匹配——商品文案中可能包含 similar 词汇导致误判。
+    不用短页面兜底——网络差时页面未完全加载也会很短，导致误判。
+    """
     try:
         page_source = driver.page_source
-        if '访问暂时受限' in page_source:
+        # 英文白屏（两种已知变体）
+        if "Access is temporarily limited" in page_source:
+            return True
+        if "Access temporarily limited" in page_source:
+            return True
+        # 中文白屏
+        if "访问暂时受限" in page_source:
             return True
     except Exception:
         pass
@@ -180,12 +240,23 @@ def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
     # 等待端口释放
     time.sleep(3)
 
-    # 强制清理可能残留的占用端口的进程（仅 macOS）
+    # 强制清理可能残留的占用端口的进程
     import platform as _plat
     if _plat.system() == 'Darwin':
         try:
             import subprocess as _sp
             _sp.run(['fuser', '-k', f'{port}/tcp'], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        time.sleep(2)
+    elif _plat.system() == 'Windows':
+        try:
+            import subprocess as _sp
+            result = _sp.run(['netstat', '-ano'], capture_output=True, text=True, timeout=5)
+            for line in result.stdout.splitlines():
+                if f':{port}' in line and 'LISTENING' in line:
+                    pid = line.strip().split()[-1]
+                    _sp.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=5)
         except Exception:
             pass
         time.sleep(2)
@@ -249,9 +320,9 @@ class _DriverContext:
         """
         for attempt in range(1, 4):
             try:
-                cooldown = 0 if immediate and attempt == 1 else 5
+                cooldown = 0 if immediate and attempt == 1 else random.uniform(4, 7)
                 if cooldown > 0:
-                    print(f"    🚫 访问被限制，等待 {cooldown} 秒后恢复（第 {attempt} 次）...")
+                    print(f"    🚫 访问被限制，等待 {cooldown:.1f} 秒后恢复（第 {attempt} 次）...")
                     time.sleep(cooldown)
                 else:
                     print(f"    🚫 立即尝试恢复（第 {attempt} 次）...")
@@ -261,7 +332,15 @@ class _DriverContext:
                 for home_attempt in range(1, 4):
                     try:
                         self.driver.get("https://www.etsy.com/")
-                        time.sleep(5)
+                        # 等待页面就绪（兼容 Windows 渲染延迟）
+                        try:
+                            from selenium.webdriver.support.ui import WebDriverWait as _Hdw
+                            _Hdw(self.driver, 15).until(
+                                lambda d: d.execute_script("return document.readyState") == "complete"
+                            )
+                        except Exception:
+                            pass
+                        time.sleep(random.uniform(4, 6))
                         if not _is_access_blocked(self.driver):
                             home_ok = True
                             break

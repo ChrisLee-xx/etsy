@@ -121,14 +121,15 @@ def get_default_output_folder() -> str:
 
 
 class ScraperWorker:
-    """后台抓取工作器"""
+    """后台抓取工作器（Selenium + undetected-chromedriver）"""
     
     def __init__(self, app, mode: str, urls: List[str], output_dir: str,
                  image_selection: Optional[List[int]] = None,
                  filter_words: Optional[List[str]] = None,
                  delay: float = 2.0,
                  resume: bool = True,
-                 port: int = 9222):
+                 port: int = 9222,
+                 use_tabs: bool = False):
         self.app = app
         self.mode = mode
         self.urls = urls
@@ -138,9 +139,21 @@ class ScraperWorker:
         self.delay = delay
         self.resume = resume
         self.port = port
+        self.use_tabs = use_tabs
         self.chrome_process = None
         self.driver = None
+        self.ctx = None  # _DriverContext
+        
         self._stop_flag = False
+        self._pause_flag = threading.Event()
+        self._pause_flag.set()  # 初始非暂停
+        self._is_paused = False
+        
+        # 线程安全锁：保护 driver/chrome_process 的读写
+        self._driver_lock = threading.Lock()
+        
+        # 手动介入相关（gui 线程读写，需同步）
+        self._skip_blocked_prompt = False
         
         self._thread = None
     
@@ -150,31 +163,57 @@ class ScraperWorker:
     def update_progress(self, current: int, total: int):
         self.app.after(0, lambda: self.app.update_progress(current, total))
     
+    def _wait_if_paused(self):
+        """在关键检查点等待暂停解除"""
+        if not self._pause_flag.is_set():
+            self._is_paused = True
+            self.app.after(0, lambda: self.app._update_pause_ui(True))
+            self._pause_flag.wait()
+            self._is_paused = False
+            self.app.after(0, lambda: self.app._update_pause_ui(False))
+    
+    def pause(self):
+        """暂停抓取（不关闭浏览器）"""
+        self._pause_flag.clear()
+        self.log("⏸️ 已暂停（浏览器保持运行，可自由操作）")
+    
+    def resume_worker(self):
+        """恢复抓取"""
+        self._pause_flag.set()
+        self.log("▶️ 已恢复抓取")
+    
+    def _safe_update_driver(self):
+        """线程安全地同步 ctx.driver 到 self.driver（worker 线程调用）"""
+        with self._driver_lock:
+            if self.ctx:
+                self.driver = self.ctx.driver
+                self.chrome_process = self.ctx.chrome_process
+    
     def stop(self):
+        """停止抓取并关闭浏览器（不阻塞 GUI 线程）"""
         self._stop_flag = True
-        # 主动中断 Selenium session（立即解除所有 driver 阻塞调用）
-        if self.driver:
-            try:
-                self.driver.quit()
-            except Exception:
-                pass
+        self._pause_flag.set()  # 解除暂停以便线程退出
+        
+        with self._driver_lock:
+            d = self.driver
             self.driver = None
-        # 强制关闭 Chrome 进程
-        if self.chrome_process:
-            try:
-                self.chrome_process.terminate()
-            except Exception:
-                pass
+            p = self.chrome_process
             self.chrome_process = None
-    
-    
-    def _safe_terminate(self, proc):
-        """安全终止进程，仅当进程存活时才调用 terminate"""
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+        
+        # 后台线程清理，避免 driver.quit() 阻塞 GUI
+        def _cleanup():
+            if d:
+                try:
+                    d.quit()
+                except Exception:
+                    pass
+            if p and p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        
+        threading.Thread(target=_cleanup, daemon=True).start()
     
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -182,45 +221,47 @@ class ScraperWorker:
     
     def _run(self):
         try:
-            self.log("🚀 启动 Chrome 浏览器...")
-            self.chrome_process = start_chrome_with_debug(self.urls[0], self.port)
-            
-            self.log("⏳ 等待浏览器就绪...")
-            if not wait_for_chrome_ready(self.port):
-                self.app.after(0, lambda: self.app.on_finished(False, "Chrome 启动失败！请先关闭所有 Chrome 窗口。"))
-                return
-            
-            self.log("✅ Chrome 已启动！")
-            time.sleep(3)
-            self.log("✅ 开始抓取...")
-            
-            self.driver = create_patched_driver(self.port)
-            self.ctx = _DriverContext(self.driver, self.chrome_process, self.port)
-            
-            # 开始前检测封锁，自动重启恢复
-            if _is_access_blocked(self.driver):
-                self.log("🚫 检测到访问限制，自动重启 Chrome...")
-                if self.ctx.handle_block(self.urls[0]):
-                    self.driver = self.ctx.driver
-                    self.chrome_process = self.ctx.chrome_process
-                    self.log("✅ 已恢复，继续抓取")
-                else:
-                    self.app.after(0, lambda: self.app.on_finished(False, "访问被限制，多次重启仍无法恢复"))
-                    return
-            
             if self.mode == 'product':
-                self._scrape_products()
+                self._run_product_mode()
             else:
-                self._scrape_sections()
-            
+                self._run_section_mode()
         except Exception as e:
             tb = traceback.format_exc()
-            error_msg = f"{type(e).__name__}: {e}"
-            self.log(f"❌ {tb}")
-            self.app.after(0, lambda m=error_msg: self.app.on_finished(False, f"错误: {m}"))
+            self.log(f"❌ {type(e).__name__}: {e}")
+            self.log(f"{tb}")
+            self.app.after(0, lambda e=e: self.app.on_finished(False, f"错误: {type(e).__name__}: {e}"))
         finally:
-            self._safe_terminate(self.ctx.chrome_process if hasattr(self, 'ctx') and self.ctx else None)
-            self._safe_terminate(self.chrome_process)
+            if self.chrome_process and self.chrome_process.poll() is None:
+                try:
+                    self.chrome_process.terminate()
+                except Exception:
+                    pass
+    
+    # ========== 单商品模式 ==========
+    
+    def _run_product_mode(self):
+        self.log("🚀 启动 Chrome 浏览器...")
+        self.chrome_process = start_chrome_with_debug(self.urls[0], self.port)
+        
+        self.log("⏳ 等待浏览器就绪...")
+        if not wait_for_chrome_ready(self.port):
+            self.app.after(0, lambda: self.app.on_finished(False, "Chrome 启动失败！请先关闭所有 Chrome 窗口。"))
+            return
+        
+        self.log("✅ Chrome 已启动！")
+        self.driver = create_patched_driver(self.port)
+        self.ctx = _DriverContext(self.driver, self.chrome_process, self.port)
+        
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait as _Wdw
+            _Wdw(self.driver, 20).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            self.log("✅ 页面就绪")
+        except Exception:
+            time.sleep(3)
+        
+        self._scrape_products()
     
     def _scrape_products(self):
         total = len(self.urls)
@@ -231,6 +272,7 @@ class ScraperWorker:
         output_path.mkdir(parents=True, exist_ok=True)
 
         for idx, url in enumerate(self.urls, 1):
+            self._wait_if_paused()
             if self._stop_flag:
                 break
 
@@ -243,10 +285,9 @@ class ScraperWorker:
                     time.sleep(2)
                 except Exception as e:
                     if _is_browser_disconnected(e):
-                        self.log(f"  🔌 Chrome 连接断开，立即重启后重试...")
+                        self.log("  🔌 Chrome 连接断开，尝试重启...")
                         if self.ctx.handle_block(url, immediate=True):
-                            self.driver = self.ctx.driver
-                            self.chrome_process = self.ctx.chrome_process
+                            self._safe_update_driver()
                             consecutive_fails = 0
                         else:
                             self.log("  ❌ 无法恢复，停止")
@@ -254,12 +295,10 @@ class ScraperWorker:
                     else:
                         self.log(f"  ❌ 导航失败: {e}")
                         fail_count += 1
-                        consecutive_fails += 1
                         continue
 
-            # 封锁检测
             if _is_access_blocked(self.ctx.driver):
-                self.log("🚫 检测到访问限制，自动重启 Chrome...")
+                self.log("🚫 检测到访问限制，自动恢复...")
                 if self.ctx.handle_block(url):
                     self.log("✅ 已恢复")
                     consecutive_fails = 0
@@ -271,10 +310,9 @@ class ScraperWorker:
                 result = extract_data_with_selenium(self.ctx.driver)
             except Exception as e:
                 if _is_browser_disconnected(e):
-                    self.log("  🔌 Chrome 连接断开，立即重启后重试当前商品...")
+                    self.log("  🔌 连接断开，立即重启后重试...")
                     if self.ctx.handle_block(url, immediate=True):
-                        self.driver = self.ctx.driver
-                        self.chrome_process = self.ctx.chrome_process
+                        self._safe_update_driver()
                         try:
                             result = extract_data_with_selenium(self.ctx.driver)
                         except Exception as retry_error:
@@ -291,21 +329,16 @@ class ScraperWorker:
                 self.log("  ❌ 抓取失败！")
                 fail_count += 1
                 consecutive_fails += 1
-
                 if consecutive_fails >= 3:
-                    self.log(f"\n⚠️ 连续 {consecutive_fails} 次失败，尝试重启 Chrome...")
                     if self.ctx.handle_block(url):
-                        self.log("✅ 已恢复，继续")
                         consecutive_fails = 0
                     else:
-                        self.log("❌ 无法恢复，停止")
                         break
                 continue
 
             success_count += 1
             consecutive_fails = 0
             self.log(f"  ✅ {result.get('title', '')[:40]}...")
-            self.log(f"  📷 图片: {len(result.get('images', []))} 张")
 
             product_id = result.get('product_id', 'unknown')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -313,25 +346,51 @@ class ScraperWorker:
             json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
 
             self._download_images(result.get('images', []), result.get('title', ''), output_path)
-
-            # driver 可能在封锁恢复后被替换，同步引用
-            self.driver = self.ctx.driver
-            self.chrome_process = self.ctx.chrome_process
+            self._safe_update_driver()
 
             if idx < total:
-                time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
+                try:
+                    from .real_chrome_scraper import human_delay
+                except ImportError:
+                    from real_chrome_scraper import human_delay
+                human_delay(self.delay, 1.0)
 
         if not self._stop_flag:
             self.update_progress(total, total)
         if self._stop_flag:
-            if success_count > 0:
-                self.app.after(0, lambda: self.app.on_finished(True,
-                    f"已中断！部分完成 - 成功: {success_count}, 失败: {fail_count}"))
-            else:
-                self.app.after(0, lambda: self.app.on_finished(False,
-                    f"已中断！成功: {success_count}, 失败: {fail_count}"))
+            msg = f"已中断！部分完成 - 成功: {success_count}, 失败: {fail_count}"
+            self.app.after(0, lambda m=msg: self.app.on_finished(success_count > 0, m))
         else:
-            self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {success_count}, 失败: {fail_count}"))
+            msg = f"完成！成功: {success_count}, 失败: {fail_count}"
+            self.app.after(0, lambda m=msg: self.app.on_finished(True, m))
+    
+    # ========== Section 批量模式（Selenium） ==========
+    
+    def _run_section_mode(self):
+        self.log("🚀 启动 Chrome 浏览器...")
+        self.chrome_process = start_chrome_with_debug(self.urls[0], self.port)
+        
+        self.log("⏳ 等待浏览器就绪...")
+        if not wait_for_chrome_ready(self.port):
+            self.app.after(0, lambda: self.app.on_finished(False, "Chrome 启动失败！请先关闭所有 Chrome 窗口。"))
+            return
+        
+        self.log("✅ Chrome 已启动！")
+        self.driver = create_patched_driver(self.port)
+        self.ctx = _DriverContext(self.driver, self.chrome_process, self.port)
+        
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait as _Wdw
+            _Wdw(self.driver, 20).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            self.log("✅ 页面就绪")
+        except Exception:
+            self.log("⏳ 页面就绪检测超时（网络可能较慢），继续尝试...")
+            time.sleep(3)
+        
+        self.log("🔍 开始提取 Section 信息...")
+        self._scrape_sections()
     
     def _scrape_sections(self):
         total_sections = len(self.urls)
@@ -340,6 +399,7 @@ class ScraperWorker:
         stopped_early = False
         
         for sec_idx, url in enumerate(self.urls, 1):
+            self._wait_if_paused()
             if self._stop_flag:
                 stopped_early = True
                 break
@@ -352,61 +412,48 @@ class ScraperWorker:
             
             self.log(f"\n[Section {sec_idx}/{total_sections}] {shop_name}")
             
+            # Section 间导航
             if sec_idx > 1:
                 try:
                     self.ctx.driver.get(url)
                     time.sleep(2)
+                    for _ in range(3):
+                        scroll_distance = random.randint(300, 500)
+                        self.ctx.driver.execute_script(f"window.scrollBy(0, {scroll_distance})")
+                        time.sleep(random.uniform(0.8, 1.5))
+                    self.ctx.driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.5)")
+                    time.sleep(1)
                 except Exception as e:
-                    self.log(f"  ❌ 导航失败: {e}，尝试重启 Chrome...")
-                    if self.ctx.handle_block(url, section_url=url):
-                        self.driver = self.ctx.driver
-                        self.chrome_process = self.ctx.chrome_process
-                        self.log("  ✅ 已恢复")
-                    else:
-                        self.log("  ❌ 无法恢复，跳过此 Section")
-                        continue
+                    self.log(f"  ❌ 导航失败: {e}，跳过此 Section")
+                    continue
             
-            # 获取 Section 信息（在创建输出目录之前），Chrome 断连时自动恢复
+            # 获取 Section 信息
             try:
+                self.log(f"  🔍 正在解析 Section 信息 (section_id={section_id})...")
                 section_name, total_items = get_section_info(self.ctx.driver, section_id)
             except Exception as e:
-                self.log(f"  ❌ 获取 Section 信息失败: {e}，尝试重启 Chrome...")
-                if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
-                    self.driver = self.ctx.driver
-                    self.chrome_process = self.ctx.chrome_process
-                    self.log("  ✅ 已恢复，重试...")
-                    try:
-                        section_name, total_items = get_section_info(self.ctx.driver, section_id)
-                    except Exception as retry_error:
-                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
-                        continue
-                else:
-                    self.log("  ❌ 无法恢复，跳过此 Section")
-                    continue
-            self.log(f"  Section: {section_name} ({total_items} 件)")
+                self.log(f"  ❌ 获取 Section 信息失败: {e}，跳过此 Section")
+                continue
+            self.log(f"  ✓ Section: {section_name} ({total_items} 件商品)")
             
-            # 使用 section 名称命名文件夹
-            if section_name and section_name != "section":
-                section_dir_name = sanitize_folder_name(section_name)
-            else:
-                section_dir_name = f"{shop_name}_{section_id}"
+            # 创建输出目录
+            dir_name = sanitize_folder_name(section_name) if section_name and section_name != "section" else f"{shop_name}_{section_id}"
+            output_path = Path(self.output_dir) / dir_name
             
-            # 同名文件夹冲突检测
-            candidate_path = Path(self.output_dir) / section_dir_name
-            if candidate_path.exists():
-                progress_file = candidate_path / ".progress.json"
+            if output_path.exists():
+                progress_file = output_path / ".progress.json"
                 if progress_file.exists():
                     try:
                         with open(progress_file, 'r', encoding='utf-8') as f:
-                            existing_progress = json.load(f)
-                        if existing_progress.get('section_id') != section_id:
-                            section_dir_name = f"{section_dir_name}_{section_id}"
+                            existing = json.load(f)
+                        if existing.get('section_id') != section_id:
+                            output_path = Path(self.output_dir) / f"{dir_name}_{section_id}"
                     except Exception:
                         pass
             
-            output_path = Path(self.output_dir) / section_dir_name
             output_path.mkdir(parents=True, exist_ok=True)
             
+            # 进度管理
             progress = ScrapeProgress(output_path, url, shop_name, section_id)
             completed_ids: Set[str] = set()
             if self.resume:
@@ -417,33 +464,26 @@ class ScraperWorker:
                 except Exception:
                     pass
             
+            # 提取商品链接
             try:
+                self.log(f"  🔍 正在提取商品链接 (total={total_items})...")
                 listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
                                                      stop_check=lambda: self._stop_flag)
             except Exception as e:
-                self.log(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
-                if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
-                    self.driver = self.ctx.driver
-                    self.chrome_process = self.ctx.chrome_process
-                    self.log("  ✅ 已恢复，重试...")
-                    try:
-                        listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
-                                                             stop_check=lambda: self._stop_flag)
-                    except Exception as retry_error:
-                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
-                        continue
-                else:
-                    self.log("  ❌ 无法恢复，跳过此 Section")
-                    continue
+                self.log(f"  ❌ 提取商品链接失败: {e}，跳过此 Section")
+                continue
             
             if not listing_ids:
-                self.log("  ❌ 没有找到商品")
+                self.log("  ❌ 未找到商品（页面可能未完全加载或已被封锁）")
                 continue
             
             self.log(f"  ✅ 找到 {len(listing_ids)} 个商品")
             progress.set_total_found(len(listing_ids))
             
             pending_ids = [lid for lid in listing_ids if lid not in completed_ids]
+            skipped = len(completed_ids & set(listing_ids))
+            if skipped:
+                self.log(f"  📋 断点续传：跳过 {skipped} 个已完成")
             
             if not pending_ids:
                 self.log("  ✅ 全部完成")
@@ -453,7 +493,9 @@ class ScraperWorker:
             consecutive_fails = 0
             
             for i, listing_id in enumerate(pending_ids, 1):
+                self._wait_if_paused()
                 if self._stop_flag:
+                    stopped_early = True
                     break
                 
                 self.update_progress(i, len(pending_ids))
@@ -462,7 +504,8 @@ class ScraperWorker:
                 if process_product(self.ctx, listing_id, output_path, name_tracker,
                                   image_selection=self.image_selection,
                                   filter_words=self.filter_words,
-                                  section_url=url):
+                                  section_url=url, log_cb=self.log,
+                                  use_tabs=self.use_tabs):
                     total_success += 1
                     consecutive_fails = 0
                     progress.save(listing_id)
@@ -474,7 +517,8 @@ class ScraperWorker:
                     
                     if consecutive_fails >= 3:
                         product_url = f"https://www.etsy.com/listing/{listing_id}"
-                        self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁，自动重启 Chrome...")
+                        self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁…")
+                        self._on_blocked_detected()
                         if self.ctx.handle_block(product_url, section_url=url):
                             self.log("✅ 已恢复，继续抓取")
                             consecutive_fails = 0
@@ -482,41 +526,57 @@ class ScraperWorker:
                             self.log("❌ 无法恢复，停止当前 Section")
                             stopped_early = True
                             break
-
-                # driver 可能在封锁恢复后被替换，同步引用
-                self.driver = self.ctx.driver
-                self.chrome_process = self.ctx.chrome_process
+                
+                self._safe_update_driver()
                 
                 if i < len(pending_ids):
-                    time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
+                    try:
+                        from .real_chrome_scraper import human_delay
+                    except ImportError:
+                        from real_chrome_scraper import human_delay
+                    human_delay(self.delay, 1.0)
             
             if not self._stop_flag:
                 self.update_progress(len(pending_ids), len(pending_ids))
         
-        # 区分正常完成和提前退出（stop 或连续失败）
         if stopped_early or self._stop_flag:
             if total_success > 0:
-                self.app.after(0, lambda: self.app.on_finished(True,
-                    f"已中断！部分完成 - 成功: {total_success}, 失败: {total_fail}"))
+                msg = f"已中断！部分完成 - 成功: {total_success}, 失败: {total_fail}"
+                self.app.after(0, lambda m=msg: self.app.on_finished(True, m))
             else:
-                self.app.after(0, lambda: self.app.on_finished(False,
-                    f"已中断！成功: {total_success}, 失败: {total_fail}"))
+                msg = f"已中断！成功: {total_success}, 失败: {total_fail}"
+                self.app.after(0, lambda m=msg: self.app.on_finished(False, m))
         else:
-            self.app.after(0, lambda: self.app.on_finished(True, f"完成！成功: {total_success}, 失败: {total_fail}"))
+            msg = f"完成！成功: {total_success}, 失败: {total_fail}"
+            self.app.after(0, lambda m=msg: self.app.on_finished(True, m))
+    
+    def _on_blocked_detected(self):
+        """检测到 Etsy 限流时的回调：通知 GUI 弹窗"""
+        if self._skip_blocked_prompt or self._stop_flag:
+            return
+        self.log("  🚫 检测到访问限制，等待手动操作...")
+        # 自动暂停让用户操作浏览器
+        self._pause_flag.clear()
+        self.app.after(0, self._show_blocked_prompt)
+    
+    def _show_blocked_prompt(self):
+        """显示手动介入弹窗"""
+        BlockedPopup(self)
+    
+    # ========== 图片下载（共用） ==========
     
     def _download_images(self, images: List[str], title: str, output_dir: Path):
         import requests
-
         if not images or not title:
             return
 
         try:
-            from .utils import filter_title
+            from .utils import filter_title as _ft
         except ImportError:
-            from utils import filter_title
+            from utils import filter_title as _ft
         display_title = title
         if self.filter_words:
-            display_title = filter_title(title, self.filter_words)
+            display_title = _ft(title, self.filter_words)
 
         safe_title = sanitize_filename(display_title)
 
@@ -537,15 +597,111 @@ class ScraperWorker:
                 ext = url.split('.')[-1].split('?')[0] or 'jpg'
                 filename = f"{safe_title}-{idx}.{ext}"
                 filepath = output_dir / filename
-
                 resp = requests.get(url, headers=headers, timeout=30)
                 if resp.status_code == 200:
                     filepath.write_bytes(resp.content)
                     self.log(f"    📥 图片 {idx}")
             except Exception:
                 self.log(f"    ❌ 图片 {idx} 下载失败")
-
             time.sleep(random.uniform(0.3, 0.8))
+
+
+class BlockedPopup(ctk.CTkToplevel):
+    """Etsy 访问限制时的手动介入弹窗"""
+    
+    def __init__(self, worker: ScraperWorker):
+        super().__init__()
+        self.worker = worker
+        self._start_time = time.time()
+        
+        self.title("Etsy 访问限制")
+        self.geometry("450x280")
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        
+        # 内容
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=25, pady=20)
+        
+        ctk.CTkLabel(
+            frame,
+            text="🚫 检测到 Etsy 访问限制",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#dc3545",
+        ).pack(anchor="w", pady=(0, 10))
+        
+        ctk.CTkLabel(
+            frame,
+            text="请手动操作浏览器 1-2 分钟：\n"
+                 " • 随机浏览几个 Etsy 商品页面\n"
+                 " • 正常滑动、点击即可\n"
+                 " • 白屏消失后点击【继续抓取】",
+            font=ctk.CTkFont(size=14),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+        
+        self.timer_label = ctk.CTkLabel(
+            frame,
+            text="⏱️ 已等待 0 秒",
+            font=ctk.CTkFont(size=13),
+            text_color="gray",
+        )
+        self.timer_label.pack(anchor="w", pady=(0, 15))
+        
+        # 按钮
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x")
+        
+        ctk.CTkCheckBox(
+            btn_frame,
+            text="本轮不再提示（自动等待恢复）",
+            font=ctk.CTkFont(size=13),
+            command=self._on_skip_toggle,
+        ).pack(side="left")
+        
+        ctk.CTkButton(
+            btn_frame,
+            text="继续抓取",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
+            width=100,
+            height=35,
+            command=self._on_resume,
+        ).pack(side="right", padx=(10, 0))
+        
+        ctk.CTkButton(
+            btn_frame,
+            text="放弃",
+            font=ctk.CTkFont(size=14),
+            fg_color="#6c757d",
+            hover_color="#5a6268",
+            width=80,
+            height=35,
+            command=self._on_cancel,
+        ).pack(side="right")
+        
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+        self._update_timer()
+    
+    def _update_timer(self):
+        if self.winfo_exists():
+            elapsed = int(time.time() - self._start_time)
+            self.timer_label.configure(text=f"⏱️ 已等待 {elapsed} 秒")
+            self.after(1000, self._update_timer)
+    
+    def _on_skip_toggle(self):
+        self.worker._skip_blocked_prompt = True
+    
+    def _on_resume(self):
+        self.worker.resume_worker()
+        self.destroy()
+    
+    def _on_cancel(self):
+        self.worker._stop_flag = True
+        self.worker._pause_flag.set()
+        self.worker.log("⚠️ 用户放弃等待，停止抓取")
+        self.destroy()
 
 
 class App(ctk.CTk):
@@ -620,19 +776,46 @@ class App(ctk.CTk):
         )
         self.progress_label.pack(side="left")
         
-        # 右边：按钮
+        # 右边：按钮组（暂停 | 继续 | 停止）
         self.stop_btn = ctk.CTkButton(
             control_frame,
             text="⏹️ 停止",
-            font=ctk.CTkFont(size=14, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             fg_color="#dc3545",
             hover_color="#c82333",
-            width=100,
+            width=85,
             height=40,
             state="disabled",
             command=self.on_stop
         )
-        self.stop_btn.pack(side="right")
+        self.stop_btn.pack(side="right", padx=(5, 0))
+        
+        self.resume_btn = ctk.CTkButton(
+            control_frame,
+            text="▶️ 继续",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#28a745",
+            hover_color="#218838",
+            width=85,
+            height=40,
+            state="disabled",
+            command=self.on_resume
+        )
+        self.resume_btn.pack(side="right", padx=(5, 0))
+        
+        self.pause_btn = ctk.CTkButton(
+            control_frame,
+            text="⏸️ 暂停",
+            font=ctk.CTkFont(size=13),
+            fg_color="#ffc107",
+            hover_color="#e0a800",
+            text_color="#212529",
+            width=85,
+            height=40,
+            state="disabled",
+            command=self.on_pause
+        )
+        self.pause_btn.pack(side="right", padx=(5, 0))
         
         # ========== 日志区域 ==========
         log_label = ctk.CTkLabel(
@@ -806,6 +989,13 @@ class App(ctk.CTk):
         self.section_resume.pack(side="left", padx=(30, 0))
         self.section_resume.select()
         
+        self.section_tabs = ctk.CTkCheckBox(
+            row4,
+            text="新标签页模式（会切换窗口，影响正常使用）",
+            font=ctk.CTkFont(size=14)
+        )
+        self.section_tabs.pack(side="left", padx=(30, 0))
+        
         # 开始按钮
         self.section_start_btn = ctk.CTkButton(
             parent,
@@ -919,33 +1109,63 @@ class App(ctk.CTk):
             filter_words=filter_words,
             delay=delay,
             resume=self.section_resume.get(),
-            port=port
+            port=port,
+            use_tabs=self.section_tabs.get(),
         )
     
     def start_worker(self, **kwargs):
-        # 如果已有运行中的 worker，忽略重复启动
         if self.worker is not None:
-            # worker 还在清理中（on_finished 尚未执行），忽略本次请求
             return
         
         self.log_text.delete("0.0", "end")
         self.product_start_btn.configure(state="disabled")
         self.section_start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
+        self.pause_btn.configure(state="normal")
+        self.resume_btn.configure(state="disabled")
         self.progress_bar.set(0)
         self.progress_label.configure(text="启动中...")
         
         self.worker = ScraperWorker(self, **kwargs)
         self.worker.start()
     
+    def on_pause(self):
+        """暂停：不关闭浏览器，worker 线程在检查点阻塞"""
+        if self.worker:
+            self.worker.pause()
+            self.pause_btn.configure(state="disabled")
+            self.resume_btn.configure(state="normal")
+            self.progress_label.configure(text="⏸️ 已暂停")
+    
+    def on_resume(self):
+        """恢复：解除暂停，继续抓取"""
+        if self.worker:
+            self.worker.resume_worker()
+            self.pause_btn.configure(state="normal")
+            self.resume_btn.configure(state="disabled")
+            self.progress_label.configure(text="▶️ 运行中")
+    
+    def _update_pause_ui(self, paused: bool):
+        """worker 内部暂停/恢复时更新按钮状态"""
+        if paused:
+            self.pause_btn.configure(state="disabled")
+            self.resume_btn.configure(state="normal")
+            self.progress_label.configure(text="⏸️ 已暂停")
+        else:
+            self.pause_btn.configure(state="normal")
+            self.resume_btn.configure(state="disabled")
+            self.progress_label.configure(text="▶️ 运行中")
+    
     def on_stop(self):
         if self.worker:
             self.worker.stop()
             self.log("⚠️ 正在停止...")
         
-        # 5秒超时保护：如果线程未及时退出，强制恢复 UI
+        self.pause_btn.configure(state="disabled")
+        self.resume_btn.configure(state="disabled")
+        
         def force_finish():
-            if self.worker is None:  # 已被正常的 on_finished 清理过
+            if self.worker is None:
                 return
             if self.worker._thread.is_alive():
                 self.log("⏱️ 强制结束抓取...")
@@ -957,6 +1177,8 @@ class App(ctk.CTk):
         self.product_start_btn.configure(state="normal")
         self.section_start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.pause_btn.configure(state="disabled")
+        self.resume_btn.configure(state="disabled")
         self.worker = None
         
         if success:

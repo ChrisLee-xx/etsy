@@ -67,11 +67,11 @@ def build_app():
         # Add src directory to Python path
         "--paths", str(SRC_DIR),
         
-        # Add other source files as data (will be extracted to _MEIPASS)
-        "--add-data", f"{SRC_DIR / 'section_scraper.py'}{sep}.",
-        "--add-data", f"{SRC_DIR / 'real_chrome_scraper.py'}{sep}.",
-        "--add-data", f"{SRC_DIR / 'utils.py'}{sep}.",
-        
+        # Add other source files as data (用 os.fspath 保证 Win/Mac 路径兼容)
+        "--add-data", f"{str(SRC_DIR / 'section_scraper.py').replace(chr(92), '/')}{sep}.",
+        "--add-data", f"{str(SRC_DIR / 'real_chrome_scraper.py').replace(chr(92), '/')}{sep}.",
+        "--add-data", f"{str(SRC_DIR / 'utils.py').replace(chr(92), '/')}{sep}.",
+
         # Hidden imports for our modules
         "--hidden-import", "section_scraper",
         "--hidden-import", "real_chrome_scraper",
@@ -83,6 +83,7 @@ def build_app():
         "--hidden-import", "selenium.webdriver.chrome.options",
         "--hidden-import", "selenium.webdriver.chrome.service",
         "--hidden-import", "selenium.webdriver.common.by",
+        "--hidden-import", "selenium.webdriver.common.action_chains",
         "--hidden-import", "selenium.webdriver.support.ui",
         "--hidden-import", "selenium.webdriver.support.expected_conditions",
         "--hidden-import", "requests",
