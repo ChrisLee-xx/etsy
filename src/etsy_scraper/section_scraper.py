@@ -263,34 +263,38 @@ def build_page_url(section_url: str, page: int) -> str:
 
 
 def extract_product_links(driver, section_url: str, total_items: int = 0,
-                          stop_check=None) -> List[str]:
+                          stop_check=None, log_cb=None) -> List[str]:
+    """兼容旧调用：收集所有页的 ID 后一起返回（CLI 用）"""
+    _log = log_cb if log_cb else print
+    result = []
+    for page_ids in iter_product_pages(driver, section_url, total_items, stop_check, _log):
+        result.extend(page_ids)
+    return result
+
+
+def iter_product_pages(driver, section_url: str, total_items: int = 0,
+                       stop_check=None, log_cb=None):
     """
-    从 Section 页面提取所有商品链接（基于 URL 参数翻页）
+    逐页生成商品链接（生成器），GUI 每页立即处理，减少翻页集中度避免封锁
     
-    翻页策略：
-    1. 先抓取第 1 页，获取实际每页商品数 (items_per_page)
-    2. 结合 total_items 计算总页数: ceil(total_items / items_per_page)
-    3. 从第 2 页开始逐页构造 URL 访问
-    
-    跨平台兼容性优化：
-    - 使用 WebDriverWait 替代固定 sleep，确保商品卡片 DOM 已渲染
-    - 多选择器回退机制，兼容不同版本的 Etsy 页面结构
-    - 页面就绪检测（readyState + scrollHeight 稳定检测）
-    - 卡片查找重试机制，解决 Windows 渲染延迟问题
+    每页 yield (page_ids: List[str])，调用方应在 yield 后立即处理这批商品
     
     Args:
         driver: Selenium WebDriver 实例
         section_url: Section 页面 URL
         total_items: Section 总商品数（用于计算总页数，0 则逐页探测）
-        stop_check: 可选的停止检查回调函数，返回 True 时提前退出翻页循环
+        stop_check: 可选的停止检查回调函数
+        log_cb: 日志回调
         
-    Returns:
-        商品 listing_id 列表
+    Yields:
+        每页的商品 listing_id 列表
     """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     
-    # 商品卡片的 CSS 选择器列表（按优先级排列，兼容不同 Etsy 页面版本）
+    _log = log_cb if log_cb else print
+    
+    # 商品卡片的 CSS 选择器列表
     CARD_SELECTORS = [
         'div.v2-listing-card[data-listing-id]',
         'div[data-listing-id]',
@@ -298,18 +302,16 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         'div.listing-card[data-listing-id]',
     ]
     
-    all_listing_ids = []
     seen_ids = set()
     items_per_page = 0
     total_pages = None
     current_page = 1
     
-    print(f"\n📊 Section 总商品数: {total_items}" if total_items > 0 else "\n📊 总商品数未知，将逐页探测")
+    _log(f"\n📊 Section 总商品数: {total_items}" if total_items > 0 else "\n📊 总商品数未知，将逐页探测")
     
     # ----- 辅助函数：等待页面内容就绪 -----
     def _wait_page_ready(timeout=15):
-        """等待页面渲染完成，返回 (ok, reason)。网络慢时延长等待并提示。"""
-        # 等待 readyState complete
+        """等待页面渲染完成"""
         ready_ok = False
         try:
             WebDriverWait(driver, timeout).until(
@@ -320,8 +322,7 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
             pass
         
         if not ready_ok:
-            # readyState 超时 → 可能是网络慢，延长等待再试一次
-            print("    ⏳ 页面加载较慢（readyState 超时），延长等待 10 秒...")
+            _log("    ⏳ 页面加载较慢（readyState 超时），延长等待 10 秒...")
             try:
                 WebDriverWait(driver, 10).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
@@ -330,7 +331,6 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
             except Exception:
                 pass
         
-        # 等待 body 有内容
         try:
             WebDriverWait(driver, timeout).until(
                 lambda d: d.execute_script("return document.body.scrollHeight") > 100
@@ -338,17 +338,16 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         except Exception:
             pass
         
-        # 页面高度稳定检测
         try:
             prev_height = driver.execute_script("return document.body.scrollHeight")
-            for i in range(5):  # 从 3 轮增加到 5 轮（网络慢时懒加载需要更久）
+            for i in range(5):
                 time.sleep(1.5)
                 new_height = driver.execute_script("return document.body.scrollHeight")
                 if new_height == prev_height:
                     break
                 prev_height = new_height
-                if i >= 2:  # 第 3 轮还不稳定，提示网络慢
-                    print(f"    ⏳ 页面仍在加载内容（ scrollHeight 持续变化），网络可能较慢...")
+                if i >= 2:
+                    _log(f"    ⏳ 页面仍在加载内容（ scrollHeight 持续变化），网络可能较慢...")
         except Exception:
             pass
     
@@ -376,16 +375,16 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
     while True:
         # 检查停止信号
         if stop_check and stop_check():
-            print("  → 收到停止信号，停止翻页")
+            _log("  → 收到停止信号，停止翻页")
             break
 
         # 构造当前页 URL
         page_url = build_page_url(section_url, current_page)
         
         if total_pages is not None:
-            print(f"\n📄 正在处理第 {current_page}/{total_pages} 页...")
+            _log(f"\n📄 正在处理第 {current_page}/{total_pages} 页...")
         else:
-            print(f"\n📄 正在处理第 {current_page} 页...")
+            _log(f"\n📄 正在处理第 {current_page} 页...")
         
         # 导航到当前页（超时时自动重试一次，适应网络波动）
         nav_ok = False
@@ -398,10 +397,10 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
                 if _is_browser_disconnected(e):
                     raise
                 if nav_attempt == 0:
-                    print(f"  ⏳ 页面加载超时（可能是网络较慢），等待 5 秒后重试...")
+                    _log(f"  ⏳ 页面加载超时（可能是网络较慢），等待 5 秒后重试...")
                     time.sleep(5)
                 else:
-                    print(f"  ✗ 页面导航失败（已重试）: {e}")
+                    _log(f"  ✗ 页面导航失败（已重试）: {e}")
         if not nav_ok:
             break
         
@@ -414,7 +413,7 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
         except Exception as e:
             if _is_browser_disconnected(e):
                 raise
-            print(f"  ✗ 页面滚动失败: {e}")
+            _log(f"  ✗ 页面滚动失败: {e}")
         
         # 提取当前页的商品 listing_id（带重试机制，解决 Windows 渲染延迟）
         page_ids = []
@@ -426,7 +425,7 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
                     break
                 # 没找到卡片，等待渲染后再重试
                 if retry < max_retries - 1:
-                    print(f"  ⏳ 未找到商品卡片，等待页面渲染后重试 ({retry + 1}/{max_retries - 1})...")
+                    _log(f"  ⏳ 未找到商品卡片，等待页面渲染后重试 ({retry + 1}/{max_retries - 1})...")
                     time.sleep(3)
                     # 再次滚动以触发可能的延迟渲染
                     try:
@@ -437,26 +436,29 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
             except Exception as e:
                 if _is_browser_disconnected(e):
                     raise
-                print(f"  ✗ 提取商品失败 (第{retry + 1}次): {e}")
+                _log(f"  ✗ 提取商品失败 (第{retry + 1}次): {e}")
                 if retry >= max_retries - 1:
                     break
                 time.sleep(2)
         
-        # 记录新发现的商品
-        for listing_id in page_ids:
-            if listing_id not in seen_ids:
-                seen_ids.add(listing_id)
-                all_listing_ids.append(listing_id)
+        # 记录并 yield 本页商品
+        new_page_ids = [lid for lid in page_ids if lid not in seen_ids]
+        for lid in new_page_ids:
+            seen_ids.add(lid)
         
-        new_count = len(page_ids)
-        print(f"  ✓ 本页找到 {new_count} 个新商品")
+        new_count = len(new_page_ids)
+        _log(f"  ✓ 本页找到 {new_count} 个新商品")
+        
+        # yield 本页商品（调用方应在此时立即处理这批商品）
+        if new_page_ids:
+            yield new_page_ids
         
         # 如果本页无新商品，停止翻页
         if not page_ids:
             if current_page == 1:
-                print("  → 第 1 页无商品卡片，请检查页面是否正常加载")
+                _log("  → 第 1 页无商品卡片，请检查页面是否正常加载")
             else:
-                print("  → 本页无新商品，停止翻页")
+                _log("  → 本页无新商品，停止翻页")
             break
         
         # 第一页抓取完成后，动态计算每页商品数和总页数
@@ -464,25 +466,23 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
             items_per_page = new_count
             if items_per_page > 0:
                 total_pages = math.ceil(total_items / items_per_page)
-                print(f"  📊 每页 {items_per_page} 个商品，预计共 {total_pages} 页")
+                _log(f"  📊 每页 {items_per_page} 个商品，预计共 {total_pages} 页")
                 
                 # 如果只有 1 页，直接结束
                 if total_pages <= 1:
-                    print(f"  → 仅 1 页，无需翻页")
+                    _log(f"  → 仅 1 页，无需翻页")
                     break
             else:
-                print(f"  ⚠️ 无法计算页数（每页商品数为 0），将逐页探测")
+                _log(f"  ⚠️ 无法计算页数（每页商品数为 0），将逐页探测")
         
         # 检查是否已到达最后一页
         if total_pages is not None:
             if current_page >= total_pages:
-                print(f"  → 已到达最后一页 ({current_page}/{total_pages})")
+                _log(f"  → 已到达最后一页 ({current_page}/{total_pages})")
                 break
         
         current_page += 1
         time.sleep(2)  # 翻页间延迟
-    
-    return all_listing_ids
 
 
 def scroll_page(driver, scroll_times: int = 5):

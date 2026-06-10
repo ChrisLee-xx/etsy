@@ -30,7 +30,7 @@ import customtkinter as ctk
 try:
     from .section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
-        extract_product_links, process_product, ImageNameTracker,
+        iter_product_pages, process_product, ImageNameTracker,
         sanitize_folder_name,
     )
     from .real_chrome_scraper import (
@@ -42,7 +42,7 @@ try:
 except ImportError:
     from section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
-        extract_product_links, process_product, ImageNameTracker,
+        iter_product_pages, process_product, ImageNameTracker,
         sanitize_folder_name,
     )
     from real_chrome_scraper import (
@@ -464,80 +464,78 @@ class ScraperWorker:
                 except Exception:
                     pass
             
-            # 提取商品链接
+            # 逐页提取 + 立即处理（避免集中翻页触发封锁）
+            name_tracker = ImageNameTracker()
+            consecutive_fails = 0
+            total_page_found = 0
+            product_counter = 0
+            
             try:
-                self.log(f"  🔍 正在提取商品链接 (total={total_items})...")
-                listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
-                                                     stop_check=lambda: self._stop_flag)
+                page_gen = iter_product_pages(self.ctx.driver, url, total_items=total_items,
+                                               stop_check=lambda: self._stop_flag, log_cb=self.log)
+                for page_ids in page_gen:
+                    self._wait_if_paused()
+                    if self._stop_flag:
+                        stopped_early = True
+                        break
+                    
+                    total_page_found += len(page_ids)
+                    pending = [lid for lid in page_ids if lid not in completed_ids]
+                    if not pending:
+                        continue
+                    
+                    for listing_id in pending:
+                        self._wait_if_paused()
+                        if self._stop_flag:
+                            stopped_early = True
+                            break
+                        
+                        product_counter += 1
+                        self.update_progress(product_counter, total_items or len(page_ids))
+                        self.log(f"  [{product_counter}] 处理商品 {listing_id}...")
+                        
+                        if process_product(self.ctx, listing_id, output_path, name_tracker,
+                                          image_selection=self.image_selection,
+                                          filter_words=self.filter_words,
+                                          section_url=url, log_cb=self.log,
+                                          use_tabs=self.use_tabs):
+                            total_success += 1
+                            consecutive_fails = 0
+                            progress.save(listing_id)
+                            self.log(f"    ✅ [{product_counter}] 完成")
+                        else:
+                            total_fail += 1
+                            consecutive_fails += 1
+                            self.log(f"    ❌ [{product_counter}] 失败")
+                            if consecutive_fails >= 3:
+                                self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁…")
+                                self._on_blocked_detected(section_url=url)
+                                consecutive_fails = 0
+                        
+                        self._safe_update_driver()
+                        try:
+                            from .real_chrome_scraper import human_delay
+                        except ImportError:
+                            from real_chrome_scraper import human_delay
+                        human_delay(self.delay, 1.0)
+                    
+                    if self._stop_flag:
+                        stopped_early = True
+                        break
+                        
             except Exception as e:
                 self.log(f"  ❌ 提取商品链接失败: {e}，跳过此 Section")
                 continue
             
-            if not listing_ids:
+            if total_page_found == 0:
                 self.log("  ❌ 未找到商品（页面可能未完全加载或已被封锁）")
                 continue
             
-            self.log(f"  ✅ 找到 {len(listing_ids)} 个商品")
-            progress.set_total_found(len(listing_ids))
-            
-            pending_ids = [lid for lid in listing_ids if lid not in completed_ids]
-            skipped = len(completed_ids & set(listing_ids))
-            if skipped:
-                self.log(f"  📋 断点续传：跳过 {skipped} 个已完成")
-            
-            if not pending_ids:
-                self.log("  ✅ 全部完成")
-                continue
-            
-            name_tracker = ImageNameTracker()
-            consecutive_fails = 0
-            
-            for i, listing_id in enumerate(pending_ids, 1):
-                self._wait_if_paused()
-                if self._stop_flag:
-                    stopped_early = True
-                    break
-                
-                self.update_progress(i, len(pending_ids))
-                self.log(f"  [{i}/{len(pending_ids)}] 处理商品 {listing_id}...")
-                
-                if process_product(self.ctx, listing_id, output_path, name_tracker,
-                                  image_selection=self.image_selection,
-                                  filter_words=self.filter_words,
-                                  section_url=url, log_cb=self.log,
-                                  use_tabs=self.use_tabs):
-                    total_success += 1
-                    consecutive_fails = 0
-                    progress.save(listing_id)
-                    self.log(f"    ✅ [{i}/{len(pending_ids)}] 完成")
-                else:
-                    total_fail += 1
-                    consecutive_fails += 1
-                    self.log(f"    ❌ [{i}/{len(pending_ids)}] 失败")
-                    
-                    if consecutive_fails >= 3:
-                        product_url = f"https://www.etsy.com/listing/{listing_id}"
-                        self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁…")
-                        self._on_blocked_detected()
-                        if self.ctx.handle_block(product_url, section_url=url):
-                            self.log("✅ 已恢复，继续抓取")
-                            consecutive_fails = 0
-                        else:
-                            self.log("❌ 无法恢复，停止当前 Section")
-                            stopped_early = True
-                            break
-                
-                self._safe_update_driver()
-                
-                if i < len(pending_ids):
-                    try:
-                        from .real_chrome_scraper import human_delay
-                    except ImportError:
-                        from real_chrome_scraper import human_delay
-                    human_delay(self.delay, 1.0)
+            self.log(f"  ✅ 共找到 {total_page_found} 个商品")
+            progress.set_total_found(total_page_found)
             
             if not self._stop_flag:
-                self.update_progress(len(pending_ids), len(pending_ids))
+                self.update_progress(product_counter, product_counter)
         
         if stopped_early or self._stop_flag:
             if total_success > 0:
@@ -550,12 +548,70 @@ class ScraperWorker:
             msg = f"完成！成功: {total_success}, 失败: {total_fail}"
             self.app.after(0, lambda m=msg: self.app.on_finished(True, m))
     
-    def _on_blocked_detected(self):
-        """检测到 Etsy 限流时的回调：通知 GUI 弹窗"""
+    def _on_blocked_detected(self, section_url: str = None):
+        """检测到 Etsy 限流：关闭旧 Chrome → 起全新浏览器 → 弹窗让用户手动建立信任"""
         if self._skip_blocked_prompt or self._stop_flag:
             return
-        self.log("  🚫 检测到访问限制，等待手动操作...")
-        # 自动暂停让用户操作浏览器
+        self.log("  🚫 检测到访问限制，正在重启全新浏览器...")
+        
+        # 关闭旧 Chrome
+        with self._driver_lock:
+            d = self.driver
+            self.driver = None
+            p = self.chrome_process
+            self.chrome_process = None
+        
+        if d:
+            try:
+                d.quit()
+            except Exception:
+                pass
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=5)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        
+        # 清理 profile，确保全新会话
+        import shutil
+        profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
+        if profile_dir.exists():
+            try:
+                shutil.rmtree(profile_dir)
+                self.log("  ✓ 已清理旧浏览器数据")
+            except Exception:
+                pass
+        
+        # 起全新 Chrome（打开 Etsy 首页，不是 section）
+        self.log("  🔄 启动全新浏览器...")
+        try:
+            from .real_chrome_scraper import start_chrome_with_debug, wait_for_chrome_ready, create_patched_driver, _DriverContext
+            new_chrome = start_chrome_with_debug("https://www.etsy.com/", self.port)
+            if not wait_for_chrome_ready(self.port, timeout=20):
+                self.log("  ❌ 新浏览器启动失败")
+                self._pause_flag.clear()
+                self.app.after(0, self._show_blocked_prompt)
+                return
+            new_driver = create_patched_driver(self.port)
+            new_ctx = _DriverContext(new_driver, new_chrome, self.port)
+            with self._driver_lock:
+                self.chrome_process = new_chrome
+                self.driver = new_driver
+                self.ctx = new_ctx
+        except Exception as e:
+            self.log(f"  ❌ 重启浏览器失败: {e}")
+            self._pause_flag.clear()
+            self.app.after(0, self._show_blocked_prompt)
+            return
+        
+        self.log("  ✅ 全新浏览器已启动")
+        self.log("  📌 请在浏览器中手动打开 Section 页面并随意浏览 1-2 分钟...")
+        
+        # 暂停 + 弹窗
         self._pause_flag.clear()
         self.app.after(0, self._show_blocked_prompt)
     
@@ -632,10 +688,10 @@ class BlockedPopup(ctk.CTkToplevel):
         
         ctk.CTkLabel(
             frame,
-            text="请手动操作浏览器 1-2 分钟：\n"
-                 " • 随机浏览几个 Etsy 商品页面\n"
-                 " • 正常滑动、点击即可\n"
-                 " • 白屏消失后点击【继续抓取】",
+            text="全新浏览器已启动，请手动操作：\n"
+                 " • 打开目标 Section 页面\n"
+                 " • 随机浏览几个商品，正常滑动点击\n"
+                 " • 确认白屏消失后点击【继续抓取】",
             font=ctk.CTkFont(size=14),
             justify="left",
         ).pack(anchor="w", pady=(0, 10))
