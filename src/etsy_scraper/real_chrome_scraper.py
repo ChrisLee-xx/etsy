@@ -180,15 +180,32 @@ def _restart_chrome_fresh(chrome_process, url: str, port: int = 9222):
     # 等待端口释放
     time.sleep(3)
 
-    # 强制清理可能残留的占用端口的进程（仅 macOS）
+    # 强制清理可能残留的占用端口的进程
     import platform as _plat
-    if _plat.system() == 'Darwin':
+    system = _plat.system()
+    if system == 'Darwin':
         try:
             import subprocess as _sp
             _sp.run(['fuser', '-k', f'{port}/tcp'], capture_output=True, timeout=5)
         except Exception:
             pass
-        time.sleep(2)
+    elif system == 'Windows':
+        try:
+            import subprocess as _sp
+            # 查找占用端口的 PID
+            result = _sp.run(
+                ['netstat', '-ano'], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                if f':{port}' in line and 'LISTENING' in line:
+                    parts = line.strip().split()
+                    pid = parts[-1]
+                    # 终止占用端口的进程
+                    _sp.run(['taskkill', '/F', '/PID', pid], capture_output=True, timeout=5)
+                    break
+        except Exception:
+            pass
+    time.sleep(2)
 
     profile_dir = Path.home() / ".etsy_scraper_chrome_profile"
     if profile_dir.exists():

@@ -83,6 +83,7 @@ def build_app():
         "--hidden-import", "selenium.webdriver.chrome.options",
         "--hidden-import", "selenium.webdriver.chrome.service",
         "--hidden-import", "selenium.webdriver.common.by",
+        "--hidden-import", "selenium.webdriver.common.action_chains",
         "--hidden-import", "selenium.webdriver.support.ui",
         "--hidden-import", "selenium.webdriver.support.expected_conditions",
         "--hidden-import", "requests",
@@ -92,6 +93,7 @@ def build_app():
         "--hidden-import", "idna",
         "--hidden-import", "customtkinter",
         "--hidden-import", "undetected_chromedriver",
+        "--hidden-import", "undetected_chromedriver.patcher",
         "--hidden-import", "PIL",
         "--hidden-import", "PIL.Image",
         "--hidden-import", "PIL._tkinter_finder",
@@ -109,6 +111,9 @@ def build_app():
         
         # Collect all customtkinter resources
         "--collect-all", "customtkinter",
+        
+        # Collect all undetected_chromedriver resources (includes chromedriver binaries + patches)
+        "--collect-all", "undetected_chromedriver",
         
         main_script,
     ]
