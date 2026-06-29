@@ -4,6 +4,7 @@ Etsy Scraper GUI - CustomTkinter 桌面应用
 import json
 import os
 import random
+import re
 import ssl
 import sys
 import threading
@@ -14,8 +15,14 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Set
 
-# 修复 macOS 上 Python 的 SSL 证书问题
-ssl._create_default_https_context = ssl._create_unverified_context
+# 修复 macOS 上 Python 的 SSL 证书问题（使用 certifi 证书，而非全局禁用验证）
+try:
+    import certifi
+    ssl._create_default_https_context = ssl.create_default_context
+    ssl._create_default_https_context.load_verify_locations(certifi.where())
+except Exception:
+    # certifi 不可用时回退到默认上下文（仍启用验证）
+    ssl._create_default_https_context = ssl.create_default_context
 
 # PyInstaller 打包后，添加 _MEIPASS 到 sys.path
 if getattr(sys, 'frozen', False):
@@ -152,20 +159,20 @@ class ScraperWorker:
     
     def stop(self):
         self._stop_flag = True
-        # 主动中断 Selenium session（立即解除所有 driver 阻塞调用）
-        if self.driver:
+        # 只设置停止标志，driver/进程清理由后台线程在 finally 中自行完成
+        # 避免与后台线程竞态操作 driver 导致 InvalidSessionId 等异常
+
+    def _force_cleanup(self):
+        """强制清理 driver 和 Chrome 进程（超时保护时调用）"""
+        driver = getattr(self, 'driver', None) or getattr(getattr(self, 'ctx', None), 'driver', None)
+        if driver:
             try:
-                self.driver.quit()
+                driver.quit()
             except Exception:
                 pass
-            self.driver = None
-        # 强制关闭 Chrome 进程
-        if self.chrome_process:
-            try:
-                self.chrome_process.terminate()
-            except Exception:
-                pass
-            self.chrome_process = None
+        ctx_proc = getattr(getattr(self, 'ctx', None), 'chrome_process', None)
+        self._safe_terminate(ctx_proc)
+        self._safe_terminate(self.chrome_process)
     
     
     def _safe_terminate(self, proc):
@@ -194,8 +201,10 @@ class ScraperWorker:
             time.sleep(3)
             self.log("✅ 开始抓取...")
             
+            self.log("🔗 连接 Chrome 驱动...")
             self.driver = create_patched_driver(self.port)
             self.ctx = _DriverContext(self.driver, self.chrome_process, self.port)
+            self.log("✅ 驱动已连接")
             
             # 开始前检测封锁，自动重启恢复
             if _is_access_blocked(self.driver):
@@ -219,7 +228,16 @@ class ScraperWorker:
             self.log(f"❌ {tb}")
             self.app.after(0, lambda m=error_msg: self.app.on_finished(False, f"错误: {m}"))
         finally:
-            self._safe_terminate(self.ctx.chrome_process if hasattr(self, 'ctx') and self.ctx else None)
+            # 清理 driver（quit 会同时关闭 chromedriver 进程）
+            driver = getattr(self, 'driver', None) or getattr(getattr(self, 'ctx', None), 'driver', None)
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            # 清理 Chrome 进程
+            ctx_proc = getattr(getattr(self, 'ctx', None), 'chrome_process', None)
+            self._safe_terminate(ctx_proc)
             self._safe_terminate(self.chrome_process)
     
     def _scrape_products(self):
@@ -237,25 +255,33 @@ class ScraperWorker:
             self.log(f"\n[{idx}/{total}] 处理商品...")
             self.update_progress(idx, total)
 
-            if idx > 1:
-                try:
-                    self.ctx.driver.get(url)
-                    time.sleep(2)
-                except Exception as e:
-                    if _is_browser_disconnected(e):
-                        self.log(f"  🔌 Chrome 连接断开，立即重启后重试...")
-                        if self.ctx.handle_block(url, immediate=True):
-                            self.driver = self.ctx.driver
-                            self.chrome_process = self.ctx.chrome_process
-                            consecutive_fails = 0
-                        else:
-                            self.log("  ❌ 无法恢复，停止")
-                            break
+            # 所有商品都显式导航（包括第一个），确保 Selenium 接管页面加载
+            # 不能依赖 Chrome 启动时自动加载的 URL，否则 page_source 等操作可能无限阻塞
+            try:
+                self.log("  → 导航到商品页...")
+                self.ctx.driver.get(url)
+                time.sleep(2)
+            except Exception as e:
+                if _is_browser_disconnected(e):
+                    self.log(f"  🔌 Chrome 连接断开，立即重启后重试...")
+                    if self.ctx.handle_block(url, immediate=True):
+                        self.driver = self.ctx.driver
+                        self.chrome_process = self.ctx.chrome_process
+                        consecutive_fails = 0
+                        # 恢复后重新导航到目标商品页
+                        try:
+                            self.ctx.driver.get(url)
+                            time.sleep(2)
+                        except Exception:
+                            pass
                     else:
-                        self.log(f"  ❌ 导航失败: {e}")
-                        fail_count += 1
-                        consecutive_fails += 1
-                        continue
+                        self.log("  ❌ 无法恢复，停止")
+                        break
+                else:
+                    self.log(f"  ❌ 导航失败: {e}")
+                    fail_count += 1
+                    consecutive_fails += 1
+                    continue
 
             # 封锁检测
             if _is_access_blocked(self.ctx.driver):
@@ -275,6 +301,12 @@ class ScraperWorker:
                     if self.ctx.handle_block(url, immediate=True):
                         self.driver = self.ctx.driver
                         self.chrome_process = self.ctx.chrome_process
+                        # 恢复后重新导航到目标商品页再提取
+                        try:
+                            self.ctx.driver.get(url)
+                            time.sleep(2)
+                        except Exception:
+                            pass
                         try:
                             result = extract_data_with_selenium(self.ctx.driver)
                         except Exception as retry_error:
@@ -526,8 +558,13 @@ class ScraperWorker:
             download_list = [(i+1, url) for i, url in enumerate(images)]
 
         headers = {
-            "User-Agent": get_random_ua(),
-            "Referer": "https://www.etsy.com/"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": "https://www.etsy.com/",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
         }
 
         for idx, url in download_list:
@@ -535,17 +572,138 @@ class ScraperWorker:
                 return
             try:
                 ext = url.split('.')[-1].split('?')[0] or 'jpg'
+                if ext not in ('jpg', 'jpeg', 'png', 'gif', 'webp'):
+                    ext = 'jpg'
                 filename = f"{safe_title}-{idx}.{ext}"
                 filepath = output_dir / filename
 
                 resp = requests.get(url, headers=headers, timeout=30)
-                if resp.status_code == 200:
+                if resp.status_code == 200 and len(resp.content) > 1000:
                     filepath.write_bytes(resp.content)
-                    self.log(f"    📥 图片 {idx}")
-            except Exception:
-                self.log(f"    ❌ 图片 {idx} 下载失败")
+                    self.log(f"    📥 图片 {idx} ({len(resp.content)//1024}KB)")
+                else:
+                    # 最高清图下载失败，不回退低清版本，保存链接供二次抓取
+                    reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
+                    try:
+                        from .utils import save_failed_image
+                    except ImportError:
+                        from utils import save_failed_image
+                    save_failed_image(output_dir, title, url, idx, reason)
+                    self.log(f"    ❌ 图片 {idx} 下载失败 ({reason})，已保存链接待二次抓取")
+            except Exception as e:
+                # 异常时也保存链接
+                try:
+                    from .utils import save_failed_image
+                except ImportError:
+                    from utils import save_failed_image
+                save_failed_image(output_dir, title, url, idx, str(e))
+                self.log(f"    ❌ 图片 {idx} 下载失败: {e}，已保存链接待二次抓取")
 
             time.sleep(random.uniform(0.3, 0.8))
+
+
+class RetryFailedWorker:
+    """重试失败图片的工作器，从 failed_images.json 读取并重新下载"""
+
+    def __init__(self, app, output_dir: str, failed_list: list):
+        self.app = app
+        self.output_dir = Path(output_dir)
+        self.failed_list = failed_list
+        self._stop_flag = False
+        self._thread = None
+
+    def log(self, msg: str):
+        self.app.after(0, lambda: self.app.log(msg))
+
+    def update_progress(self, current: int, total: int):
+        self.app.after(0, lambda: self.app.update_progress(current, total))
+
+    def stop(self):
+        self._stop_flag = True
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        import requests as _req
+
+        total = len(self.failed_list)
+        success_count = 0
+        remaining_records = []
+
+        self.log(f"🔄 开始重试 {total} 张失败图片...\n")
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Referer": "https://www.etsy.com/",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+
+        for i, record in enumerate(self.failed_list, 1):
+            if self._stop_flag:
+                # 停止时剩余记录全部保留
+                remaining_records.extend(self.failed_list[i-1:])
+                break
+
+            self.update_progress(i, total)
+            title = record.get('title', 'unnamed')
+            url = record.get('image_url', '')
+            idx = record.get('image_index', i)
+
+            if not url:
+                remaining_records.append(record)
+                continue
+
+            safe_title = sanitize_filename(title)
+            ext = url.split('.')[-1].split('?')[0] or 'jpg'
+            if ext not in ('jpg', 'jpeg', 'png', 'gif', 'webp'):
+                ext = 'jpg'
+            filename = f"{safe_title}-{idx}.{ext}"
+            filepath = self.output_dir / filename
+
+            try:
+                resp = _req.get(url, headers=headers, timeout=30)
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    filepath.write_bytes(resp.content)
+                    success_count += 1
+                    self.log(f"  ✅ [{i}/{total}] {filename} ({len(resp.content)//1024}KB)")
+                else:
+                    # 仍然失败，保留记录
+                    reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
+                    record['reason'] = reason
+                    record['retry_at'] = datetime.now().isoformat()
+                    remaining_records.append(record)
+                    self.log(f"  ❌ [{i}/{total}] {filename} ({reason})")
+            except Exception as e:
+                record['reason'] = str(e)
+                record['retry_at'] = datetime.now().isoformat()
+                remaining_records.append(record)
+                self.log(f"  ❌ [{i}/{total}] {filename} ({e})")
+
+            time.sleep(random.uniform(0.3, 0.8))
+
+        # 更新 failed_images.json：只保留仍然失败的记录
+        failed_file = self.output_dir / "failed_images.json"
+        try:
+            if remaining_records:
+                with open(failed_file, 'w', encoding='utf-8') as f:
+                    json.dump(remaining_records, f, ensure_ascii=False, indent=2)
+            else:
+                # 全部成功，删除文件
+                failed_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        if not self._stop_flag:
+            self.update_progress(total, total)
+
+        remaining = len(remaining_records)
+        self.app.after(0, lambda: self.app.on_retry_finished(success_count, total, remaining))
 
 
 class App(ctk.CTk):
@@ -621,6 +779,18 @@ class App(ctk.CTk):
         self.progress_label.pack(side="left")
         
         # 右边：按钮
+        self.retry_failed_btn = ctk.CTkButton(
+            control_frame,
+            text="🔄 重试失败图片",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#fd7e14",
+            hover_color="#e8630a",
+            width=140,
+            height=40,
+            command=self.on_retry_failed
+        )
+        self.retry_failed_btn.pack(side="right", padx=(0, 8))
+
         self.stop_btn = ctk.CTkButton(
             control_frame,
             text="⏹️ 停止",
@@ -838,7 +1008,18 @@ class App(ctk.CTk):
             messagebox.showwarning("提示", "请输入商品链接！")
             return
         
-        urls = [u.strip() for u in urls_text.split('\n') if u.strip()]
+        # 清理 URL：去除每行首尾空白，合并被换行截断的 URL
+        # 策略：以 https:// 或 http:// 开头作为新 URL 的起始，后续不以 http 开头的行视为上一行的延续
+        raw_lines = [line.strip() for line in urls_text.split('\n') if line.strip()]
+        urls = []
+        for line in raw_lines:
+            if line.startswith('http://') or line.startswith('https://'):
+                urls.append(line)
+            elif urls:
+                # 当前行不以 http 开头，拼接到上一个 URL（被换行截断的情况）
+                urls[-1] += line
+            else:
+                urls.append(line)
         
         for url in urls:
             # 支持各种地区前缀的 Etsy 链接，如 etsy.com/listing/ 或 etsy.com/sg-en/listing/
@@ -931,6 +1112,7 @@ class App(ctk.CTk):
         self.log_text.delete("0.0", "end")
         self.product_start_btn.configure(state="disabled")
         self.section_start_btn.configure(state="disabled")
+        self.retry_failed_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self.progress_bar.set(0)
         self.progress_label.configure(text="启动中...")
@@ -943,12 +1125,15 @@ class App(ctk.CTk):
             self.worker.stop()
             self.log("⚠️ 正在停止...")
         
-        # 5秒超时保护：如果线程未及时退出，强制恢复 UI
+        # 5秒超时保护：如果线程未及时退出，强制清理并恢复 UI
         def force_finish():
             if self.worker is None:  # 已被正常的 on_finished 清理过
                 return
             if self.worker._thread.is_alive():
                 self.log("⏱️ 强制结束抓取...")
+                # 强制清理 driver 和 Chrome 进程（仅 ScraperWorker 有此方法）
+                if hasattr(self.worker, '_force_cleanup'):
+                    self.worker._force_cleanup()
             self.on_finished(False, "已手动停止")
         
         self.after(5000, force_finish)
@@ -957,6 +1142,7 @@ class App(ctk.CTk):
         self.product_start_btn.configure(state="normal")
         self.section_start_btn.configure(state="normal")
         self.stop_btn.configure(state="disabled")
+        self.retry_failed_btn.configure(state="normal")
         self.worker = None
         
         if success:
@@ -968,6 +1154,66 @@ class App(ctk.CTk):
             self.progress_label.configure(text="❌ 失败")
             if "取消" not in message and "手动停止" not in message:
                 messagebox.showerror("错误", message)
+
+    def on_retry_failed(self):
+        """重试 failed_images.json 中的失败图片"""
+        if self.worker is not None:
+            messagebox.showwarning("提示", "当前有任务正在运行，请等待完成后再重试。")
+            return
+
+        # 确定输出目录：使用当前选中 tab 的输出目录
+        current_tab = self.tabview.get()
+        if "Section" in current_tab:
+            output_dir = self.section_output.get().strip()
+        else:
+            output_dir = self.product_output.get().strip()
+
+        if not output_dir:
+            messagebox.showwarning("提示", "请先设置输出目录。")
+            return
+
+        failed_file = Path(output_dir) / "failed_images.json"
+        if not failed_file.exists():
+            messagebox.showinfo("提示", f"未找到失败记录文件：\n{failed_file}")
+            return
+
+        try:
+            with open(failed_file, 'r', encoding='utf-8') as f:
+                failed_list = json.load(f)
+        except Exception as e:
+            messagebox.showerror("错误", f"读取失败记录失败: {e}")
+            return
+
+        if not failed_list:
+            messagebox.showinfo("提示", "没有需要重试的失败图片。")
+            return
+
+        # 启动重试线程
+        self.log_text.delete("0.0", "end")
+        self.product_start_btn.configure(state="disabled")
+        self.section_start_btn.configure(state="disabled")
+        self.retry_failed_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.progress_bar.set(0)
+        self.progress_label.configure(text="重试中...")
+
+        self.worker = RetryFailedWorker(
+            self, output_dir, failed_list
+        )
+        self.worker.start()
+
+    def on_retry_finished(self, success_count: int, total: int, remaining: int):
+        """重试完成回调"""
+        self.product_start_btn.configure(state="normal")
+        self.section_start_btn.configure(state="normal")
+        self.retry_failed_btn.configure(state="normal")
+        self.stop_btn.configure(state="disabled")
+        self.worker = None
+
+        msg = f"重试完成！成功: {success_count}/{total}，剩余失败: {remaining}"
+        self.log(f"\n{'🎉' if remaining == 0 else '⚠️'} {msg}")
+        self.progress_label.configure(text="✅ 完成" if remaining == 0 else f"剩余 {remaining}")
+        messagebox.showinfo("重试完成", msg)
 
 
     def _load_saved_config(self):

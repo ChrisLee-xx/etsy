@@ -3,7 +3,10 @@
 
 供 real_chrome_scraper.py 和 section_scraper.py 共用
 """
+import json
 import re
+from datetime import datetime
+from pathlib import Path
 from typing import List
 
 
@@ -133,3 +136,48 @@ def parse_filter_words(spec: str) -> List[str]:
             words.append(word)
     
     return words
+
+
+def save_failed_image(output_dir: Path, title: str, image_url: str,
+                      image_index: int, reason: str, product_url: str = None):
+    """
+    将下载失败的图片链接保存到 failed_images.json，供后续二次抓取。
+    
+    文件位置: {output_dir}/failed_images.json
+    格式: JSON 数组，每条记录包含标题、图片URL、序号、失败原因、时间戳
+    
+    Args:
+        output_dir: 输出目录
+        title: 商品标题
+        image_url: 失败的图片 URL（fullxfull 版本）
+        image_index: 图片序号（1-indexed）
+        reason: 失败原因（如 "HTTP 404", "timeout" 等）
+        product_url: 商品页面 URL（可选）
+    """
+    failed_file = Path(output_dir) / "failed_images.json"
+    
+    # 读取已有记录
+    existing = []
+    if failed_file.exists():
+        try:
+            with open(failed_file, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    
+    # 追加新记录
+    existing.append({
+        "title": title,
+        "image_url": image_url,
+        "image_index": image_index,
+        "product_url": product_url or "",
+        "reason": reason,
+        "failed_at": datetime.now().isoformat(),
+    })
+    
+    # 写入文件
+    try:
+        with open(failed_file, 'w', encoding='utf-8') as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass

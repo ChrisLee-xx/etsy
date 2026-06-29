@@ -114,7 +114,16 @@ def create_patched_driver(port: int = 9222):
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
     service = Service(executable_path=patcher.executable_path)
-    return webdriver.Chrome(service=service, options=options)
+    driver = webdriver.Chrome(service=service, options=options)
+
+    # 立即设置超时，防止后续任何 Selenium 调用无限阻塞
+    try:
+        driver.set_page_load_timeout(30)
+        driver.set_script_timeout(15)
+    except Exception:
+        pass
+
+    return driver
 
 
 USER_AGENTS = [
@@ -605,24 +614,43 @@ def download_images(images: List[str], title: str, output_dir: Path,
         print(f"\n下载 {len(images)} 张图片...")
 
     headers = {
-        "User-Agent": get_random_ua(),
-        "Referer": "https://www.etsy.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://www.etsy.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
     }
 
     for idx, url in download_list:
         try:
             ext = url.split('.')[-1].split('?')[0] or 'jpg'
+            if ext not in ('jpg', 'jpeg', 'png', 'gif', 'webp'):
+                ext = 'jpg'
             filename = f"{safe_title}-{idx}.{ext}"
             filepath = output_dir / filename
 
             resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 200:
+            if resp.status_code == 200 and len(resp.content) > 1000:
                 filepath.write_bytes(resp.content)
-                print(f"  ✓ [{idx}/{len(images)}] {filename}")
+                print(f"  ✓ [{idx}/{len(images)}] {filename} ({len(resp.content)//1024}KB)")
             else:
-                print(f"  ✗ [{idx}/{len(images)}] HTTP {resp.status_code}")
+                # 最高清图下载失败，不回退低清版本，保存链接供二次抓取
+                reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
+                try:
+                    from .utils import save_failed_image
+                except ImportError:
+                    from utils import save_failed_image
+                save_failed_image(output_dir, title, url, idx, reason)
+                print(f"  ✗ [{idx}/{len(images)}] {reason}，已保存链接待二次抓取")
         except Exception as e:
-            print(f"  ✗ [{idx}/{len(images)}] {e}")
+            try:
+                from .utils import save_failed_image
+            except ImportError:
+                from utils import save_failed_image
+            save_failed_image(output_dir, title, url, idx, str(e))
+            print(f"  ✗ [{idx}/{len(images)}] {e}，已保存链接待二次抓取")
 
         time.sleep(random.uniform(0.3, 0.8))
 
@@ -738,6 +766,12 @@ def main():
                         print("  🔌 Chrome 连接断开，立即重启后重试...")
                         if ctx.handle_block(url, immediate=True):
                             consecutive_fails = 0
+                            # 恢复后重新导航到目标商品页
+                            try:
+                                ctx.driver.get(url)
+                                time.sleep(2)
+                            except Exception:
+                                pass
                         else:
                             print("❌ 无法恢复，停止")
                             break
@@ -751,6 +785,12 @@ def main():
             if _is_access_blocked(ctx.driver):
                 if ctx.handle_block(url):
                     consecutive_fails = 0
+                    # 恢复后重新导航到目标商品页
+                    try:
+                        ctx.driver.get(url)
+                        time.sleep(2)
+                    except Exception:
+                        pass
                 else:
                     print("❌ 无法恢复，停止")
                     break
@@ -761,6 +801,12 @@ def main():
                 if _is_browser_disconnected(e):
                     print("  🔌 Chrome 连接断开，立即重启后重试当前链接...")
                     if ctx.handle_block(url, immediate=True):
+                        # 恢复后重新导航到目标商品页再提取
+                        try:
+                            ctx.driver.get(url)
+                            time.sleep(2)
+                        except Exception:
+                            pass
                         try:
                             result = extract_data_with_selenium(ctx.driver)
                         except Exception as retry_error:

@@ -613,8 +613,13 @@ def download_images_to_section(
         download_list = [(i+1, url) for i, url in enumerate(images)]
     
     headers = {
-        "User-Agent": get_random_ua(),
-        "Referer": "https://www.etsy.com/"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://www.etsy.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
     }
 
     downloaded = 0
@@ -631,15 +636,27 @@ def download_images_to_section(
             
             # 下载图片
             resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 200:
+            if resp.status_code == 200 and len(resp.content) > 1000:
                 filepath.write_bytes(resp.content)
-                print(f"    ✓ {filename}")
+                print(f"    ✓ {filename} ({len(resp.content)//1024}KB)")
                 downloaded += 1
             else:
-                print(f"    ✗ {filename} (HTTP {resp.status_code})")
+                # 最高清图下载失败，不回退低清版本，保存链接供二次抓取
+                reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
+                try:
+                    from .utils import save_failed_image
+                except ImportError:
+                    from utils import save_failed_image
+                save_failed_image(output_dir, product_name, url, idx, reason)
+                print(f"    ✗ {filename} ({reason})，已保存链接待二次抓取")
                 
         except Exception as e:
-            print(f"    ✗ 图片 {idx} 下载失败: {e}")
+            try:
+                from .utils import save_failed_image
+            except ImportError:
+                from utils import save_failed_image
+            save_failed_image(output_dir, product_name, url, idx, str(e))
+            print(f"    ✗ 图片 {idx} 下载失败: {e}，已保存链接待二次抓取")
         
         # 短暂延迟
         time.sleep(random.uniform(0.2, 0.5))
@@ -669,6 +686,7 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
     import time as _time
     product_url = f"https://www.etsy.com/listing/{listing_id}"
     t_start = _time.time()
+    _navigated_back = False  # 标记是否已导航回 section 页面（防止递归时重复导航）
 
     try:
         # 步骤1：从 section 页面导航到商品页面
@@ -739,6 +757,8 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
         if _is_browser_disconnected(e) and retry_on_disconnect:
             print(f"    🔌 Chrome 连接断开 ({err_type}: {e})，重启后重试当前商品...")
             if ctx.handle_block(product_url, section_url=section_url, immediate=True):
+                # 递归调用会自行处理 finally 导航，标记跳过外层
+                _navigated_back = True
                 return process_product(
                     ctx,
                     listing_id,
@@ -753,8 +773,8 @@ def process_product(ctx, listing_id: str, output_dir: Path, name_tracker: ImageN
         return False
 
     finally:
-        # 无论成功或失败，都回到 section 页面
-        if section_url:
+        # 无论成功或失败，都回到 section 页面（递归重试时跳过，避免重复导航）
+        if section_url and not _navigated_back:
             try:
                 ctx.driver.get(section_url)
                 time.sleep(2)
