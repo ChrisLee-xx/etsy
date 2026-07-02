@@ -632,16 +632,16 @@ def download_images(images: List[str], title: str, output_dir: Path,
             filepath = output_dir / filename
 
             resp = requests.get(url, headers=headers, timeout=30)
-            if resp.status_code == 200 and len(resp.content) > 1000:
+            try:
+                from .utils import validate_image_response, save_failed_image
+            except ImportError:
+                from utils import validate_image_response, save_failed_image
+            
+            valid, reason = validate_image_response(resp)
+            if valid:
                 filepath.write_bytes(resp.content)
                 print(f"  ✓ [{idx}/{len(images)}] {filename} ({len(resp.content)//1024}KB)")
             else:
-                # 最高清图下载失败，不回退低清版本，保存链接供二次抓取
-                reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
-                try:
-                    from .utils import save_failed_image
-                except ImportError:
-                    from utils import save_failed_image
                 save_failed_image(output_dir, title, url, idx, reason)
                 print(f"  ✗ [{idx}/{len(images)}] {reason}，已保存链接待二次抓取")
         except Exception as e:

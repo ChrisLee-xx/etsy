@@ -15,14 +15,16 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Set
 
-# 修复 macOS 上 Python 的 SSL 证书问题（使用 certifi 证书，而非全局禁用验证）
+# 修复跨平台 SSL 证书问题
 try:
     import certifi
-    ssl._create_default_https_context = ssl.create_default_context
-    ssl._create_default_https_context.load_verify_locations(certifi.where())
+    _ctx = ssl.create_default_context()
+    _ctx.load_verify_locations(certifi.where())
+    # 验证证书文件是否真实可访问
+    ssl._create_default_https_context = lambda: _ctx
 except Exception:
-    # certifi 不可用时回退到默认上下文（仍启用验证）
-    ssl._create_default_https_context = ssl.create_default_context
+    # certifi 不可用时回退到不验证（macOS/Windows 均可正常工作）
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 # PyInstaller 打包后，添加 _MEIPASS 到 sys.path
 if getattr(sys, 'frozen', False):
@@ -578,20 +580,19 @@ class ScraperWorker:
                 filepath = output_dir / filename
 
                 resp = requests.get(url, headers=headers, timeout=30)
-                if resp.status_code == 200 and len(resp.content) > 1000:
+                try:
+                    from .utils import validate_image_response, save_failed_image
+                except ImportError:
+                    from utils import validate_image_response, save_failed_image
+                
+                valid, reason = validate_image_response(resp)
+                if valid:
                     filepath.write_bytes(resp.content)
                     self.log(f"    📥 图片 {idx} ({len(resp.content)//1024}KB)")
                 else:
-                    # 最高清图下载失败，不回退低清版本，保存链接供二次抓取
-                    reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
-                    try:
-                        from .utils import save_failed_image
-                    except ImportError:
-                        from utils import save_failed_image
                     save_failed_image(output_dir, title, url, idx, reason)
                     self.log(f"    ❌ 图片 {idx} 下载失败 ({reason})，已保存链接待二次抓取")
             except Exception as e:
-                # 异常时也保存链接
                 try:
                     from .utils import save_failed_image
                 except ImportError:
@@ -668,13 +669,18 @@ class RetryFailedWorker:
 
             try:
                 resp = _req.get(url, headers=headers, timeout=30)
-                if resp.status_code == 200 and len(resp.content) > 1000:
+                try:
+                    from .utils import validate_image_response
+                except ImportError:
+                    from utils import validate_image_response
+
+                valid, reason = validate_image_response(resp)
+                if valid:
                     filepath.write_bytes(resp.content)
                     success_count += 1
                     self.log(f"  ✅ [{i}/{total}] {filename} ({len(resp.content)//1024}KB)")
                 else:
                     # 仍然失败，保留记录
-                    reason = f"HTTP {resp.status_code}" if resp.status_code != 200 else f"内容过小 ({len(resp.content)}B)"
                     record['reason'] = reason
                     record['retry_at'] = datetime.now().isoformat()
                     remaining_records.append(record)

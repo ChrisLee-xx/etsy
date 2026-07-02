@@ -10,6 +10,70 @@ from pathlib import Path
 from typing import List
 
 
+# 图片格式魔数（文件头字节签名）
+IMAGE_MAGIC_BYTES = {
+    b'\xff\xd8\xff': 'jpeg',    # JPEG
+    b'\x89PNG\r\n\x1a\n': 'png',   # PNG
+    b'GIF87a': 'gif87a',           # GIF87a
+    b'GIF89a': 'gif89a',           # GIF89a
+    b'RIFF': 'webp',               # WebP (RIFF....WEBP)
+}
+
+
+def is_valid_image(content: bytes) -> bool:
+    """
+    验证下载的内容是否为有效图片。
+    
+    检查两项：
+    1. 内容长度至少 2KB（排除占位图和错误页面）
+    2. 文件头匹配已知图片格式的魔数签名
+    
+    Args:
+        content: 下载的原始字节内容
+        
+    Returns:
+        True 如果是有效图片，否则 False
+    """
+    if len(content) < 2048:
+        return False
+    
+    for magic, fmt in IMAGE_MAGIC_BYTES.items():
+        if content.startswith(magic):
+            return True
+    
+    return False
+
+
+def validate_image_response(resp) -> tuple:
+    """
+    验证 HTTP 响应是否包含有效的图片内容。
+    
+    Args:
+        resp: requests.Response 对象
+        
+    Returns:
+        (is_valid: bool, reason: str)
+    """
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    
+    content = resp.content
+    
+    if len(content) < 2048:
+        return False, f"内容过小 ({len(content)}B)"
+    
+    # 检查 Content-Type 头
+    ct = resp.headers.get('content-type', '')
+    if ct and not ct.startswith('image/'):
+        return False, f"非图片类型 ({ct})"
+    
+    # 检查文件头魔数
+    if not is_valid_image(content):
+        return False, "无效的图片数据"
+    
+    return True, ""
+
+
 def parse_image_selection(spec: str) -> List[int]:
     """
     解析图片选择规格字符串
