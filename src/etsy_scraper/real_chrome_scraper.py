@@ -93,6 +93,7 @@ def create_patched_driver(port: int = 9222):
     再用标准 Selenium 连接到已有的 Chrome 实例（通过 debuggerAddress）。
     自动检测 Chrome 版本以下载匹配的 chromedriver。
     """
+    import sys as _sys
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -105,15 +106,25 @@ def create_patched_driver(port: int = 9222):
         browser_str = resp.json().get("Browser", "")
         if "/" in browser_str:
             version_main = int(browser_str.split("/")[1].split(".")[0])
+            print(f"  [driver] 检测到 Chrome 版本: {version_main}", flush=True)
     except Exception:
-        pass
+        print("  [driver] 无法检测 Chrome 版本，将使用默认值", flush=True)
 
+    print("  [driver] 正在初始化反检测补丁（首次需下载 chromedriver，请稍候）...", flush=True)
     patcher = uc.Patcher(version_main=version_main)
+    
+    # 设置可执行权限（避免 Linux/Mac 上 permission denied）
+    _sys.stdout.flush()
     patcher.auto()
+    print(f"  [driver] 补丁完成: {patcher.executable_path}", flush=True)
 
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
     service = Service(executable_path=patcher.executable_path)
+    
+    # webdriver.Chrome 连接已有的 Chrome 实例（通过 debuggerAddress）
+    # 注意：此调用在后台线程中运行，不能使用 signal 做超时保护
+    # 如果 Chrome 未就绪，Selenium 内部会尝试连接直到超时
     driver = webdriver.Chrome(service=service, options=options)
 
     # 立即设置超时，防止后续任何 Selenium 调用无限阻塞
