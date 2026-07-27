@@ -150,8 +150,9 @@ class ScraperWorker:
         self.chrome_process = None
         self.driver = None
         self._stop_flag = False
-        
+
         self._thread = None
+        self._start_time = time.time()  # 用于检测卡死的 worker
     
     def log(self, msg: str):
         self.app.after(0, lambda: self.app.log(msg))
@@ -1149,10 +1150,15 @@ class App(ctk.CTk):
         if self.worker is not None:
             # 检查 worker 线程是否还活着
             thread = getattr(self.worker, '_thread', None)
-            if thread is not None and thread.is_alive():
-                # 线程确实在运行，忽略本次请求
+            start_time = getattr(self.worker, '_start_time', 0)
+            elapsed = time.time() - start_time if start_time else 0
+
+            if thread is not None and thread.is_alive() and elapsed < 600:
+                # 线程确实在运行且未超时，忽略本次请求
                 return
-            # 线程已死但 worker 未清理（上次崩溃/异常退出），清理状态后继续
+            # 线程已死，或存活超过 10 分钟（卡死），强制清理后继续
+            if elapsed >= 600:
+                self.log("⚠️ 上次抓取疑似卡死，强制清理...")
             self.worker = None
         
         self.log_text.delete("0.0", "end")
