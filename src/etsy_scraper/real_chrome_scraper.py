@@ -638,10 +638,7 @@ def download_images(images: List[str], title: str, output_dir: Path,
     try:
         from etsy_scraper.utils import filter_title
     except ImportError:
-        try:
-            from .utils import filter_title
-        except ImportError:
-            from utils import filter_title
+        from utils import filter_title  # type: ignore
     display_title = title
     if filter_words:
         display_title = filter_title(title, filter_words)
@@ -656,11 +653,11 @@ def download_images(images: List[str], title: str, output_dir: Path,
             print(f"⚠️ 跳过不存在的图片序号: {skipped_indices} (共 {len(images)} 张图片)")
 
         if not valid_indices:
-            print("⚠️ 没有有效的图片序号可下载")
-            return
-
-        download_list = [(i, images[i-1]) for i in valid_indices]
-        print(f"\n下载 {len(download_list)}/{len(images)} 张图片 (序号: {valid_indices})...")
+            print(f"⚠️ 选择的图片序号超出范围，默认下载第1张")
+            download_list = [(1, images[0])] if images else []
+        else:
+            download_list = [(i, images[i-1]) for i in valid_indices]
+            print(f"\n下载 {len(download_list)}/{len(images)} 张图片 (序号: {valid_indices})...")
     else:
         download_list = [(i+1, url) for i, url in enumerate(images)]
         print(f"\n下载 {len(images)} 张图片...")
@@ -687,10 +684,7 @@ def download_images(images: List[str], title: str, output_dir: Path,
             try:
                 from etsy_scraper.utils import validate_image_response, save_failed_image
             except ImportError:
-                try:
-                    from .utils import validate_image_response, save_failed_image
-                except ImportError:
-                    from utils import validate_image_response, save_failed_image
+                from utils import validate_image_response, save_failed_image  # type: ignore
             
             valid, reason = validate_image_response(resp)
             if valid:
@@ -703,10 +697,7 @@ def download_images(images: List[str], title: str, output_dir: Path,
             try:
                 from etsy_scraper.utils import save_failed_image
             except ImportError:
-                try:
-                    from .utils import save_failed_image
-                except ImportError:
-                    from utils import save_failed_image
+                from utils import save_failed_image  # type: ignore
             save_failed_image(output_dir, title, url, idx, str(e))
             print(f"  ✗ [{idx}/{len(images)}] {e}，已保存链接待二次抓取")
 
@@ -747,10 +738,7 @@ def main():
     try:
         from etsy_scraper.utils import parse_image_selection, parse_filter_words
     except ImportError:
-        try:
-            from .utils import parse_image_selection, parse_filter_words
-        except ImportError:
-            from utils import parse_image_selection, parse_filter_words
+        from utils import parse_image_selection, parse_filter_words  # type: ignore
 
     image_selection = None
     filter_words = None

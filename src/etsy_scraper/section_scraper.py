@@ -169,34 +169,19 @@ try:
         _extract_product_images,
     )
 except ImportError:
-    try:
-        from .real_chrome_scraper import (
-            sanitize_filename,
-            get_chrome_path,
-            start_chrome_with_debug,
-            wait_for_chrome_ready,
-            create_patched_driver,
-            get_random_ua,
-            _is_access_blocked,
-            _is_browser_disconnected,
-            _restart_chrome_fresh,
-            _DriverContext,
-            _extract_product_images,
-        )
-    except ImportError:
-        from real_chrome_scraper import (
-            sanitize_filename,
-            get_chrome_path,
-            start_chrome_with_debug,
-            wait_for_chrome_ready,
-            create_patched_driver,
-            get_random_ua,
-            _is_access_blocked,
-            _is_browser_disconnected,
-            _restart_chrome_fresh,
-            _DriverContext,
-            _extract_product_images,
-        )
+    from real_chrome_scraper import (  # type: ignore
+        sanitize_filename,
+        get_chrome_path,
+        start_chrome_with_debug,
+        wait_for_chrome_ready,
+        create_patched_driver,
+        get_random_ua,
+        _is_access_blocked,
+        _is_browser_disconnected,
+        _restart_chrome_fresh,
+        _DriverContext,
+        _extract_product_images,
+    )
 
 
 def sanitize_folder_name(name: str) -> str:
@@ -676,10 +661,7 @@ def download_images_to_section(
     try:
         from etsy_scraper.utils import filter_title
     except ImportError:
-        try:
-            from .utils import filter_title
-        except ImportError:
-            from utils import filter_title
+        from utils import filter_title  # type: ignore
     display_name = product_name
     if filter_words:
         display_name = filter_title(product_name, filter_words)
@@ -696,10 +678,10 @@ def download_images_to_section(
             print(f"    ⚠️ 跳过不存在的序号: {skipped_indices}")
         
         if not valid_indices:
-            print("    ⚠️ 没有有效的图片序号")
-            return 0
-        
-        download_list = [(i, images[i-1]) for i in valid_indices]
+            print(f"    ⚠️ 选择的图片序号超出范围，默认下载第1张")
+            download_list = [(1, images[0])] if images else []
+        else:
+            download_list = [(i, images[i-1]) for i in valid_indices]
     else:
         download_list = [(i+1, url) for i, url in enumerate(images)]
     
@@ -730,10 +712,7 @@ def download_images_to_section(
             try:
                 from etsy_scraper.utils import validate_image_response, save_failed_image
             except ImportError:
-                try:
-                    from .utils import validate_image_response, save_failed_image
-                except ImportError:
-                    from utils import validate_image_response, save_failed_image
+                from utils import validate_image_response, save_failed_image  # type: ignore
             
             valid, reason = validate_image_response(resp)
             if valid:
@@ -748,10 +727,7 @@ def download_images_to_section(
             try:
                 from etsy_scraper.utils import save_failed_image
             except ImportError:
-                try:
-                    from .utils import save_failed_image
-                except ImportError:
-                    from utils import save_failed_image
+                from utils import save_failed_image  # type: ignore
             save_failed_image(output_dir, product_name, url, idx, str(e))
             print(f"    ✗ 图片 {idx} 下载失败: {e}，已保存链接待二次抓取")
         
@@ -1034,10 +1010,7 @@ def main():
     try:
         from etsy_scraper.utils import parse_image_selection, parse_filter_words
     except ImportError:
-        try:
-            from .utils import parse_image_selection, parse_filter_words
-        except ImportError:
-            from utils import parse_image_selection, parse_filter_words
+        from utils import parse_image_selection, parse_filter_words  # type: ignore
     
     image_selection = None
     filter_words = None

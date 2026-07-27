@@ -2,6 +2,7 @@
 Etsy Scraper GUI - CustomTkinter 桌面应用
 """
 import json
+import multiprocessing
 import os
 import random
 import re
@@ -14,6 +15,9 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Set
+
+# 防止 PyInstaller 打包后 multiprocessing spawn 导致重复启动 GUI
+multiprocessing.freeze_support()
 
 # 修复跨平台 SSL 证书问题
 try:
@@ -38,7 +42,7 @@ import customtkinter as ctk
 # 导入核心功能 - 兼容 PyInstaller 打包
 _scrape_imported = False
 
-# 尝试1: 作为 etsy_scraper 包导入（开发环境和正确配置的打包环境）
+# 尝试1: 作为 etsy_scraper 包导入（开发环境）
 try:
     from etsy_scraper.section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
@@ -55,25 +59,7 @@ try:
 except ImportError:
     pass
 
-# 尝试2: 相对导入（开发环境中直接运行 gui.py）
-if not _scrape_imported:
-    try:
-        from .section_scraper import (
-            ScrapeProgress, parse_section_url, get_section_info,
-            extract_product_links, process_product, ImageNameTracker,
-            sanitize_folder_name,
-        )
-        from .real_chrome_scraper import (
-            extract_data_with_selenium, download_images, sanitize_filename,
-            create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
-            _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
-        )
-        from .utils import parse_image_selection, parse_filter_words
-        _scrape_imported = True
-    except ImportError:
-        pass
-
-# 尝试3: 绝对导入（PyInstaller 打包后作为独立脚本运行）
+# 尝试2: 直接导入（PyInstaller 打包环境）
 if not _scrape_imported:
     try:
         from section_scraper import (
@@ -410,7 +396,7 @@ class ScraperWorker:
         try:
             from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
         except ImportError:
-            from section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
+            from section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info  # type: ignore
         
         for sec_idx, url in enumerate(self.urls, 1):
             if self._stop_flag:
@@ -455,10 +441,7 @@ class ScraperWorker:
                     try:
                         from etsy_scraper.section_scraper import get_section_info
                     except ImportError:
-                        try:
-                            from .section_scraper import get_section_info
-                        except ImportError:
-                            from section_scraper import get_section_info
+                        from section_scraper import get_section_info  # type: ignore
                     display_name, total_items = get_section_info(self.ctx.driver, section_id)
             except Exception as e:
                 self.log(f"  ❌ 获取{label}信息失败: {e}，尝试重启 Chrome...")
@@ -611,10 +594,7 @@ class ScraperWorker:
         try:
             from etsy_scraper.utils import filter_title
         except ImportError:
-            try:
-                from .utils import filter_title
-            except ImportError:
-                from utils import filter_title
+            from utils import filter_title  # type: ignore
         display_title = title
         if self.filter_words:
             display_title = filter_title(title, self.filter_words)
@@ -623,6 +603,9 @@ class ScraperWorker:
 
         if self.image_selection:
             download_list = [(i, images[i-1]) for i in self.image_selection if 1 <= i <= len(images)]
+            if not download_list:
+                self.log(f"    ⚠️ 选择的图片序号超出范围，默认下载第1张")
+                download_list = [(1, images[0])] if images else []
         else:
             download_list = [(i+1, url) for i, url in enumerate(images)]
 
@@ -650,10 +633,7 @@ class ScraperWorker:
                 try:
                     from etsy_scraper.utils import validate_image_response, save_failed_image
                 except ImportError:
-                    try:
-                        from .utils import validate_image_response, save_failed_image
-                    except ImportError:
-                        from utils import validate_image_response, save_failed_image
+                    from utils import validate_image_response, save_failed_image  # type: ignore
                 
                 valid, reason = validate_image_response(resp)
                 if valid:
@@ -666,10 +646,7 @@ class ScraperWorker:
                 try:
                     from etsy_scraper.utils import save_failed_image
                 except ImportError:
-                    try:
-                        from .utils import save_failed_image
-                    except ImportError:
-                        from utils import save_failed_image
+                    from utils import save_failed_image  # type: ignore
                 save_failed_image(output_dir, title, url, idx, str(e))
                 self.log(f"    ❌ 图片 {idx} 下载失败: {e}，已保存链接待二次抓取")
 
@@ -745,10 +722,7 @@ class RetryFailedWorker:
                 try:
                     from etsy_scraper.utils import validate_image_response
                 except ImportError:
-                    try:
-                        from .utils import validate_image_response
-                    except ImportError:
-                        from utils import validate_image_response
+                    from utils import validate_image_response  # type: ignore
 
                 valid, reason = validate_image_response(resp)
                 if valid:
@@ -1161,10 +1135,7 @@ class App(ctk.CTk):
         try:
             from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url
         except ImportError:
-            try:
-                from .section_scraper import is_shop_url, parse_section_url, parse_shop_url
-            except ImportError:
-                from section_scraper import is_shop_url, parse_section_url, parse_shop_url
+            from section_scraper import is_shop_url, parse_section_url, parse_shop_url  # type: ignore
         for url in urls:
             if 'etsy.com' not in url:
                 messagebox.showerror("错误", f"无效链接（非 Etsy）:\n{url}")
