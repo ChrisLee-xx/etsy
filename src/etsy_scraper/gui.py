@@ -36,30 +36,63 @@ if getattr(sys, 'frozen', False):
 import customtkinter as ctk
 
 # 导入核心功能 - 兼容 PyInstaller 打包
+_scrape_imported = False
+
+# 尝试1: 作为 etsy_scraper 包导入（开发环境和正确配置的打包环境）
 try:
-    from .section_scraper import (
+    from etsy_scraper.section_scraper import (
         ScrapeProgress, parse_section_url, get_section_info,
         extract_product_links, process_product, ImageNameTracker,
         sanitize_folder_name,
     )
-    from .real_chrome_scraper import (
+    from etsy_scraper.real_chrome_scraper import (
         extract_data_with_selenium, download_images, sanitize_filename,
         create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
         _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
     )
-    from .utils import parse_image_selection, parse_filter_words
+    from etsy_scraper.utils import parse_image_selection, parse_filter_words
+    _scrape_imported = True
 except ImportError:
-    from section_scraper import (
-        ScrapeProgress, parse_section_url, get_section_info,
-        extract_product_links, process_product, ImageNameTracker,
-        sanitize_folder_name,
-    )
-    from real_chrome_scraper import (
-        extract_data_with_selenium, download_images, sanitize_filename,
-        create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
-        _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
-    )
-    from utils import parse_image_selection, parse_filter_words
+    pass
+
+# 尝试2: 相对导入（开发环境中直接运行 gui.py）
+if not _scrape_imported:
+    try:
+        from .section_scraper import (
+            ScrapeProgress, parse_section_url, get_section_info,
+            extract_product_links, process_product, ImageNameTracker,
+            sanitize_folder_name,
+        )
+        from .real_chrome_scraper import (
+            extract_data_with_selenium, download_images, sanitize_filename,
+            create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
+            _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
+        )
+        from .utils import parse_image_selection, parse_filter_words
+        _scrape_imported = True
+    except ImportError:
+        pass
+
+# 尝试3: 绝对导入（PyInstaller 打包后作为独立脚本运行）
+if not _scrape_imported:
+    try:
+        from section_scraper import (
+            ScrapeProgress, parse_section_url, get_section_info,
+            extract_product_links, process_product, ImageNameTracker,
+            sanitize_folder_name,
+        )
+        from real_chrome_scraper import (
+            extract_data_with_selenium, download_images, sanitize_filename,
+            create_patched_driver, start_chrome_with_debug, wait_for_chrome_ready,
+            _DriverContext, _is_access_blocked, _is_browser_disconnected, get_random_ua,
+        )
+        from utils import parse_image_selection, parse_filter_words
+        _scrape_imported = True
+    except ImportError:
+        pass
+
+if not _scrape_imported:
+    raise RuntimeError("无法导入核心模块！请检查 Python 路径配置")
 
 
 # 设置主题
@@ -374,7 +407,10 @@ class ScraperWorker:
         total_fail = 0
         stopped_early = False
         
-        from .section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
+        try:
+            from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
+        except ImportError:
+            from section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
         
         for sec_idx, url in enumerate(self.urls, 1):
             if self._stop_flag:
@@ -416,7 +452,13 @@ class ScraperWorker:
                 if is_shop:
                     display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
                 else:
-                    from .section_scraper import get_section_info
+                    try:
+                        from etsy_scraper.section_scraper import get_section_info
+                    except ImportError:
+                        try:
+                            from .section_scraper import get_section_info
+                        except ImportError:
+                            from section_scraper import get_section_info
                     display_name, total_items = get_section_info(self.ctx.driver, section_id)
             except Exception as e:
                 self.log(f"  ❌ 获取{label}信息失败: {e}，尝试重启 Chrome...")
@@ -567,9 +609,12 @@ class ScraperWorker:
             return
 
         try:
-            from .utils import filter_title
+            from etsy_scraper.utils import filter_title
         except ImportError:
-            from utils import filter_title
+            try:
+                from .utils import filter_title
+            except ImportError:
+                from utils import filter_title
         display_title = title
         if self.filter_words:
             display_title = filter_title(title, self.filter_words)
@@ -603,9 +648,12 @@ class ScraperWorker:
 
                 resp = requests.get(url, headers=headers, timeout=30)
                 try:
-                    from .utils import validate_image_response, save_failed_image
+                    from etsy_scraper.utils import validate_image_response, save_failed_image
                 except ImportError:
-                    from utils import validate_image_response, save_failed_image
+                    try:
+                        from .utils import validate_image_response, save_failed_image
+                    except ImportError:
+                        from utils import validate_image_response, save_failed_image
                 
                 valid, reason = validate_image_response(resp)
                 if valid:
@@ -616,9 +664,12 @@ class ScraperWorker:
                     self.log(f"    ❌ 图片 {idx} 下载失败 ({reason})，已保存链接待二次抓取")
             except Exception as e:
                 try:
-                    from .utils import save_failed_image
+                    from etsy_scraper.utils import save_failed_image
                 except ImportError:
-                    from utils import save_failed_image
+                    try:
+                        from .utils import save_failed_image
+                    except ImportError:
+                        from utils import save_failed_image
                 save_failed_image(output_dir, title, url, idx, str(e))
                 self.log(f"    ❌ 图片 {idx} 下载失败: {e}，已保存链接待二次抓取")
 
@@ -692,9 +743,12 @@ class RetryFailedWorker:
             try:
                 resp = _req.get(url, headers=headers, timeout=30)
                 try:
-                    from .utils import validate_image_response
+                    from etsy_scraper.utils import validate_image_response
                 except ImportError:
-                    from utils import validate_image_response
+                    try:
+                        from .utils import validate_image_response
+                    except ImportError:
+                        from utils import validate_image_response
 
                 valid, reason = validate_image_response(resp)
                 if valid:
@@ -1104,7 +1158,13 @@ class App(ctk.CTk):
                 urls.append(line)
         
         # 验证：支持 Section 链接（含 section_id）或 店铺链接（/shop/xxx）
-        from .section_scraper import is_shop_url, parse_section_url, parse_shop_url
+        try:
+            from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url
+        except ImportError:
+            try:
+                from .section_scraper import is_shop_url, parse_section_url, parse_shop_url
+            except ImportError:
+                from section_scraper import is_shop_url, parse_section_url, parse_shop_url
         for url in urls:
             if 'etsy.com' not in url:
                 messagebox.showerror("错误", f"无效链接（非 Etsy）:\n{url}")

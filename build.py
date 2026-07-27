@@ -64,18 +64,13 @@ def build_app():
         "--noconfirm",
         "--clean",
         
-        # Add src directory to Python path
-        "--paths", str(SRC_DIR),
+        # Add src directory to Python path so etsy_scraper package can be found
+        "--paths", str(SRC_DIR.parent),
         
-        # Add other source files as data (will be extracted to _MEIPASS)
-        "--add-data", f"{SRC_DIR / 'section_scraper.py'}{sep}.",
-        "--add-data", f"{SRC_DIR / 'real_chrome_scraper.py'}{sep}.",
-        "--add-data", f"{SRC_DIR / 'utils.py'}{sep}.",
-        
-        # Hidden imports for our modules
-        "--hidden-import", "section_scraper",
-        "--hidden-import", "real_chrome_scraper",
-        "--hidden-import", "utils",
+        # Hidden imports for our modules (using full package path)
+        "--hidden-import", "etsy_scraper.section_scraper",
+        "--hidden-import", "etsy_scraper.real_chrome_scraper",
+        "--hidden-import", "etsy_scraper.utils",
         
         # Hidden imports for dependencies
         "--hidden-import", "selenium",

@@ -155,7 +155,7 @@ class ScrapeProgress:
 
 # 复用 real_chrome_scraper 的核心函数
 try:
-    from .real_chrome_scraper import (
+    from etsy_scraper.real_chrome_scraper import (
         sanitize_filename,
         get_chrome_path,
         start_chrome_with_debug,
@@ -169,19 +169,34 @@ try:
         _extract_product_images,
     )
 except ImportError:
-    from real_chrome_scraper import (
-        sanitize_filename,
-        get_chrome_path,
-        start_chrome_with_debug,
-        wait_for_chrome_ready,
-        create_patched_driver,
-        get_random_ua,
-        _is_access_blocked,
-        _is_browser_disconnected,
-        _restart_chrome_fresh,
-        _DriverContext,
-        _extract_product_images,
-    )
+    try:
+        from .real_chrome_scraper import (
+            sanitize_filename,
+            get_chrome_path,
+            start_chrome_with_debug,
+            wait_for_chrome_ready,
+            create_patched_driver,
+            get_random_ua,
+            _is_access_blocked,
+            _is_browser_disconnected,
+            _restart_chrome_fresh,
+            _DriverContext,
+            _extract_product_images,
+        )
+    except ImportError:
+        from real_chrome_scraper import (
+            sanitize_filename,
+            get_chrome_path,
+            start_chrome_with_debug,
+            wait_for_chrome_ready,
+            create_patched_driver,
+            get_random_ua,
+            _is_access_blocked,
+            _is_browser_disconnected,
+            _restart_chrome_fresh,
+            _DriverContext,
+            _extract_product_images,
+        )
 
 
 def sanitize_folder_name(name: str) -> str:
@@ -659,9 +674,12 @@ def download_images_to_section(
     
     # 应用标题过滤
     try:
-        from .utils import filter_title
+        from etsy_scraper.utils import filter_title
     except ImportError:
-        from utils import filter_title
+        try:
+            from .utils import filter_title
+        except ImportError:
+            from utils import filter_title
     display_name = product_name
     if filter_words:
         display_name = filter_title(product_name, filter_words)
@@ -710,9 +728,12 @@ def download_images_to_section(
             # 下载图片并验证内容是否为真实图片
             resp = requests.get(url, headers=headers, timeout=30)
             try:
-                from .utils import validate_image_response, save_failed_image
+                from etsy_scraper.utils import validate_image_response, save_failed_image
             except ImportError:
-                from utils import validate_image_response, save_failed_image
+                try:
+                    from .utils import validate_image_response, save_failed_image
+                except ImportError:
+                    from utils import validate_image_response, save_failed_image
             
             valid, reason = validate_image_response(resp)
             if valid:
@@ -725,9 +746,12 @@ def download_images_to_section(
                 
         except Exception as e:
             try:
-                from .utils import save_failed_image
+                from etsy_scraper.utils import save_failed_image
             except ImportError:
-                from utils import save_failed_image
+                try:
+                    from .utils import save_failed_image
+                except ImportError:
+                    from utils import save_failed_image
             save_failed_image(output_dir, product_name, url, idx, str(e))
             print(f"    ✗ 图片 {idx} 下载失败: {e}，已保存链接待二次抓取")
         
@@ -1008,9 +1032,12 @@ def main():
     
     # 解析图片选择和过滤词参数
     try:
-        from .utils import parse_image_selection, parse_filter_words
+        from etsy_scraper.utils import parse_image_selection, parse_filter_words
     except ImportError:
-        from utils import parse_image_selection, parse_filter_words
+        try:
+            from .utils import parse_image_selection, parse_filter_words
+        except ImportError:
+            from utils import parse_image_selection, parse_filter_words
     
     image_selection = None
     filter_words = None

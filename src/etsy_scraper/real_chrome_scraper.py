@@ -636,9 +636,12 @@ def download_images(images: List[str], title: str, output_dir: Path,
         return
 
     try:
-        from .utils import filter_title
+        from etsy_scraper.utils import filter_title
     except ImportError:
-        from utils import filter_title
+        try:
+            from .utils import filter_title
+        except ImportError:
+            from utils import filter_title
     display_title = title
     if filter_words:
         display_title = filter_title(title, filter_words)
@@ -682,9 +685,12 @@ def download_images(images: List[str], title: str, output_dir: Path,
 
             resp = requests.get(url, headers=headers, timeout=30)
             try:
-                from .utils import validate_image_response, save_failed_image
+                from etsy_scraper.utils import validate_image_response, save_failed_image
             except ImportError:
-                from utils import validate_image_response, save_failed_image
+                try:
+                    from .utils import validate_image_response, save_failed_image
+                except ImportError:
+                    from utils import validate_image_response, save_failed_image
             
             valid, reason = validate_image_response(resp)
             if valid:
@@ -695,9 +701,12 @@ def download_images(images: List[str], title: str, output_dir: Path,
                 print(f"  ✗ [{idx}/{len(images)}] {reason}，已保存链接待二次抓取")
         except Exception as e:
             try:
-                from .utils import save_failed_image
+                from etsy_scraper.utils import save_failed_image
             except ImportError:
-                from utils import save_failed_image
+                try:
+                    from .utils import save_failed_image
+                except ImportError:
+                    from utils import save_failed_image
             save_failed_image(output_dir, title, url, idx, str(e))
             print(f"  ✗ [{idx}/{len(images)}] {e}，已保存链接待二次抓取")
 
@@ -736,9 +745,12 @@ def main():
     args = parser.parse_args()
 
     try:
-        from .utils import parse_image_selection, parse_filter_words
+        from etsy_scraper.utils import parse_image_selection, parse_filter_words
     except ImportError:
-        from utils import parse_image_selection, parse_filter_words
+        try:
+            from .utils import parse_image_selection, parse_filter_words
+        except ImportError:
+            from utils import parse_image_selection, parse_filter_words
 
     image_selection = None
     filter_words = None
