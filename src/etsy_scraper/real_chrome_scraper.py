@@ -383,6 +383,27 @@ def _extract_product_images(driver) -> List[str]:
             raise
         print(f"  方法0失败: {e}")
 
+    # 方法0b: 单图商品回退（无 carousel-pane 结构时，直接找页面上的 data-src-zoom-image）
+    if not images:
+        try:
+            zoom_imgs = driver.find_elements(
+                By.CSS_SELECTOR,
+                'img[data-src-zoom-image]'
+            )
+            for img in zoom_imgs:
+                zoom_url = img.get_attribute('data-src-zoom-image')
+                if zoom_url and 'etsystatic.com' in zoom_url:
+                    img_id = extract_image_id(zoom_url)
+                    if img_id and img_id not in seen_ids:
+                        seen_ids.add(img_id)
+                        images.append(zoom_url)
+            if images:
+                print(f"  ✓ 单图商品回退：从 data-src-zoom-image 获取 {len(images)} 张主图")
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
+            print(f"  方法0b失败: {e}")
+
     # 方法1: 画廊区域 CSS 选择器
     if not images:
         gallery_selectors = [
@@ -392,11 +413,19 @@ def _extract_product_images(driver) -> List[str]:
             'div.listing-page-image-carousel img',
             'ul.carousel-pane-list img[src*="il_"]',
             'div[data-appears-component-name="image_carousel"] img',
+            # 单图商品回退选择器
+            'div[data-component="listing-page-main-image"] img',
+            'div.listing-image-container img',
+            'img[data-carousel-first-image]',
         ]
         for selector in gallery_selectors:
             try:
                 gallery_imgs = driver.find_elements(By.CSS_SELECTOR, selector)
                 for img in gallery_imgs:
+                    # 跳过模糊背景图和缩略图
+                    class_name = img.get_attribute('class') or ''
+                    if 'blur-bg' in class_name or 'thumbnail' in class_name:
+                        continue
                     src = img.get_attribute('src') or img.get_attribute('data-src')
                     if src and 'il_' in src and 'etsystatic.com' in src:
                         img_id = extract_image_id(src)
@@ -436,6 +465,11 @@ def _extract_product_images(driver) -> List[str]:
 
                 containers.forEach(container => {
                     container.querySelectorAll('img').forEach(img => {
+                        // 跳过模糊背景图和缩略图
+                        const cls = img.className || '';
+                        if (cls.includes('blur-bg') || cls.includes('thumbnail')) {
+                            return;
+                        }
                         let src = img.src || img.dataset.src;
                         if (src && src.includes('etsystatic.com') && src.includes('/il_')) {
                             const imgId = extractImageId(src);
@@ -469,6 +503,10 @@ def _extract_product_images(driver) -> List[str]:
             if listing_match:
                 all_imgs = driver.find_elements(By.CSS_SELECTOR, 'img[src*="etsystatic.com/il_"]')
                 for img in all_imgs:
+                    # 跳过模糊背景图和缩略图
+                    class_name = img.get_attribute('class') or ''
+                    if 'blur-bg' in class_name or 'thumbnail' in class_name:
+                        continue
                     src = img.get_attribute('src')
                     if src:
                         try:

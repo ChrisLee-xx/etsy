@@ -373,18 +373,28 @@ class ScraperWorker:
         total_fail = 0
         stopped_early = False
         
+        from .section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
+        
         for sec_idx, url in enumerate(self.urls, 1):
             if self._stop_flag:
                 stopped_early = True
                 break
             
+            # 区分店铺链接和 Section 链接
+            is_shop = is_shop_url(url)
+            
             try:
-                shop_name, section_id = parse_section_url(url)
+                if is_shop:
+                    shop_name = parse_shop_url(url)
+                    section_id = "ALL"  # 店铺全品类用特殊标识
+                else:
+                    shop_name, section_id = parse_section_url(url)
             except ValueError:
                 self.log(f"\n❌ 无效 URL: {url}")
                 continue
             
-            self.log(f"\n[Section {sec_idx}/{total_sections}] {shop_name}")
+            label = f"店铺" if is_shop else f"Section"
+            self.log(f"\n[{label} {sec_idx}/{total_sections}] {shop_name}")
             
             if sec_idx > 1:
                 try:
@@ -397,36 +407,47 @@ class ScraperWorker:
                         self.chrome_process = self.ctx.chrome_process
                         self.log("  ✅ 已恢复")
                     else:
-                        self.log("  ❌ 无法恢复，跳过此 Section")
+                        self.log("  ❌ 无法恢复，跳过此 {label}")
                         continue
             
-            # 获取 Section 信息（在创建输出目录之前），Chrome 断连时自动恢复
+            # 获取信息（在创建输出目录之前），Chrome 断连时自动恢复
             try:
-                section_name, total_items = get_section_info(self.ctx.driver, section_id)
+                if is_shop:
+                    display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
+                else:
+                    from .section_scraper import get_section_info
+                    display_name, total_items = get_section_info(self.ctx.driver, section_id)
             except Exception as e:
-                self.log(f"  ❌ 获取 Section 信息失败: {e}，尝试重启 Chrome...")
+                self.log(f"  ❌ 获取{label}信息失败: {e}，尝试重启 Chrome...")
                 if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
                     self.driver = self.ctx.driver
                     self.chrome_process = self.ctx.chrome_process
                     self.log("  ✅ 已恢复，重试...")
                     try:
-                        section_name, total_items = get_section_info(self.ctx.driver, section_id)
+                        if is_shop:
+                            display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
+                        else:
+                            display_name, total_items = get_section_info(self.ctx.driver, section_id)
                     except Exception as retry_error:
-                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
+                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 {label}")
                         continue
                 else:
-                    self.log("  ❌ 无法恢复，跳过此 Section")
+                    self.log(f"  ❌ 无法恢复，跳过此 {label}")
                     continue
-            self.log(f"  Section: {section_name} ({total_items} 件)")
             
-            # 使用 section 名称命名文件夹
-            if section_name and section_name != "section":
-                section_dir_name = sanitize_folder_name(section_name)
+            info_label = f"{label}: {display_name}" if not is_shop or display_name != shop_name else f"店铺: {shop_name}"
+            self.log(f"  {info_label} ({total_items} 件)")
+            
+            # 命名文件夹
+            if is_shop:
+                dir_name = sanitize_folder_name(shop_name) + "_ALL"
+            elif display_name and display_name != "section":
+                dir_name = sanitize_folder_name(display_name)
             else:
-                section_dir_name = f"{shop_name}_{section_id}"
+                dir_name = f"{shop_name}_{section_id}"
             
             # 同名文件夹冲突检测
-            candidate_path = Path(self.output_dir) / section_dir_name
+            candidate_path = Path(self.output_dir) / dir_name
             if candidate_path.exists():
                 progress_file = candidate_path / ".progress.json"
                 if progress_file.exists():
@@ -434,11 +455,11 @@ class ScraperWorker:
                         with open(progress_file, 'r', encoding='utf-8') as f:
                             existing_progress = json.load(f)
                         if existing_progress.get('section_id') != section_id:
-                            section_dir_name = f"{section_dir_name}_{section_id}"
+                            dir_name = f"{dir_name}_{section_id}"
                     except Exception:
                         pass
             
-            output_path = Path(self.output_dir) / section_dir_name
+            output_path = Path(self.output_dir) / dir_name
             output_path.mkdir(parents=True, exist_ok=True)
             
             progress = ScrapeProgress(output_path, url, shop_name, section_id)
@@ -464,10 +485,10 @@ class ScraperWorker:
                         listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
                                                              stop_check=lambda: self._stop_flag)
                     except Exception as retry_error:
-                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 Section")
+                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 {label}")
                         continue
                 else:
-                    self.log("  ❌ 无法恢复，跳过此 Section")
+                    self.log(f"  ❌ 无法恢复，跳过此 {label}")
                     continue
             
             if not listing_ids:
@@ -756,13 +777,13 @@ class App(ctk.CTk):
         self.tabview = ctk.CTkTabview(self.main_frame, height=320)
         self.tabview.pack(fill="x", pady=(0, 15))
         
-        self.tabview.add("📂 Section 批量")
+        self.tabview.add("📂 批量抓取")
         self.tabview.add("📦 单商品抓取")
         
-        self.setup_section_tab(self.tabview.tab("📂 Section 批量"))
+        self.setup_section_tab(self.tabview.tab("📂 批量抓取"))
         self.setup_product_tab(self.tabview.tab("📦 单商品抓取"))
         
-        self.tabview.set("📂 Section 批量")
+        self.tabview.set("📂 批量抓取")
         
         # ========== 进度条和按钮（放在日志上方） ==========
         control_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
@@ -910,7 +931,7 @@ class App(ctk.CTk):
         # URL 输入
         url_label = ctk.CTkLabel(
             parent,
-            text="Section 链接（多个链接换行分隔）：",
+            text="店铺/Section 链接（多个链接换行分隔）：",
             font=ctk.CTkFont(size=14, weight="bold")
         )
         url_label.pack(anchor="w", pady=(10, 5))
@@ -1067,14 +1088,28 @@ class App(ctk.CTk):
     def start_section_scrape(self):
         urls_text = self.section_urls.get("0.0", "end").strip()
         if not urls_text:
-            messagebox.showwarning("提示", "请输入 Section 链接！")
+            messagebox.showwarning("提示", "请输入 Section 或店铺链接！")
             return
         
-        urls = [u.strip() for u in urls_text.split('\n') if u.strip()]
+        # 清理 URL：去除每行首尾空白，合并被换行截断的 URL
+        raw_lines = [line.strip() for line in urls_text.split('\n') if line.strip()]
+        urls = []
+        for line in raw_lines:
+            if line.startswith('http://') or line.startswith('https://'):
+                urls.append(line)
+            elif urls:
+                urls[-1] += line
+            else:
+                urls.append(line)
         
+        # 验证：支持 Section 链接（含 section_id）或 店铺链接（/shop/xxx）
+        from .section_scraper import is_shop_url, parse_section_url, parse_shop_url
         for url in urls:
-            if 'section_id=' not in url:
-                messagebox.showerror("错误", f"无效链接:\n{url}")
+            if 'etsy.com' not in url:
+                messagebox.showerror("错误", f"无效链接（非 Etsy）:\n{url}")
+                return
+            if '/shop/' not in url and 'section_id=' not in url:
+                messagebox.showerror("错误", f"无效链接:\n{url}\n\n支持格式:\n- Section: .../shop/xxx?section_id=yyy\n- 店铺:   .../shop/xxx")
                 return
         
         image_selection = None
@@ -1169,7 +1204,7 @@ class App(ctk.CTk):
 
         # 确定输出目录：使用当前选中 tab 的输出目录
         current_tab = self.tabview.get()
-        if "Section" in current_tab:
+        if "批量" in current_tab or "Section" in current_tab:
             output_dir = self.section_output.get().strip()
         else:
             output_dir = self.product_output.get().strip()

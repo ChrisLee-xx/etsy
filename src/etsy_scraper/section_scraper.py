@@ -239,6 +239,79 @@ def parse_section_url(url: str) -> Tuple[str, str]:
     return shop_name, section_id
 
 
+def parse_shop_url(url: str) -> str:
+    """
+    解析店铺 URL，提取 shop_name
+    
+    支持格式:
+    - https://www.etsy.com/shop/{shop_name}
+    - https://www.etsy.com/shop/{shop_name}?ref=...
+    
+    Returns:
+        shop_name 字符串
+    
+    Raises:
+        ValueError: 如果 URL 格式无效
+    """
+    parsed = urlparse(url)
+    path_match = re.search(r'/shop/([^/?]+)', parsed.path)
+    if not path_match:
+        raise ValueError(f"无效的店铺 URL: 找不到店铺名称\nURL: {url}")
+    return path_match.group(1)
+
+
+def is_shop_url(url: str) -> bool:
+    """判断是否为店铺级 URL（无 section_id 的 /shop/xxx 链接）"""
+    parsed = urlparse(url)
+    if '/shop/' not in parsed.path:
+        return False
+    query_params = parse_qs(parsed.query)
+    return 'section_id' not in query_params
+
+
+def get_shop_info(driver, shop_name: str) -> Tuple[str, int]:
+    """
+    从店铺页面获取信息：店铺显示名称 + 总商品数
+    
+    Args:
+        driver: Selenium WebDriver 实例（已在店铺页面上）
+        shop_name: 店铺名称（从 URL 提取）
+        
+    Returns:
+        Tuple[显示名称, 总商品数]
+    """
+    from selenium.webdriver.common.by import By
+    
+    try:
+        # 尝试从页面标题或 header 获取店铺显示名
+        title_elements = driver.find_elements(
+            By.CSS_SELECTOR,
+            'h1.shop-name, [data-shop-name], .shop-title'
+        )
+        display_name = None
+        if title_elements:
+            display_name = title_elements[0].text.strip()
+        
+        # 尝试获取总商品数
+        total_items = 0
+        count_elements = driver.find_elements(
+            By.CSS_SELECTOR,
+            '[data-product-count], .listing-count, .results-count'
+        )
+        for el in count_elements:
+            text = el.text.strip()
+            match = re.search(r'(\d[\d,]*)', text)
+            if match:
+                total_items = int(match.group(1).replace(',', ''))
+                break
+        
+        return display_name or shop_name, total_items
+        
+    except Exception as e:
+        print(f"  ⚠️ 获取店铺信息失败: {e}")
+        return shop_name, 0
+
+
 def build_page_url(section_url: str, page: int) -> str:
     """
     构造带 page 参数的 Section 页面 URL
