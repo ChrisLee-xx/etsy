@@ -1145,10 +1145,15 @@ class App(ctk.CTk):
         )
     
     def start_worker(self, **kwargs):
-        # 如果已有运行中的 worker，忽略重复启动
+        # 如果已有运行中的 worker，检查它是否真的还在运行
         if self.worker is not None:
-            # worker 还在清理中（on_finished 尚未执行），忽略本次请求
-            return
+            # 检查 worker 线程是否还活着
+            thread = getattr(self.worker, '_thread', None)
+            if thread is not None and thread.is_alive():
+                # 线程确实在运行，忽略本次请求
+                return
+            # 线程已死但 worker 未清理（上次崩溃/异常退出），清理状态后继续
+            self.worker = None
         
         self.log_text.delete("0.0", "end")
         self.product_start_btn.configure(state="disabled")
