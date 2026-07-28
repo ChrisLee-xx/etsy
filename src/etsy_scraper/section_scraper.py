@@ -22,6 +22,13 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 
+# 兼容 PyInstaller Windows 环境（stdout 可能为 None）
+_builtin_print = print
+def _safe_print(*args, **kwargs):
+    if sys.stdout is not None:
+        _builtin_print(*args, **kwargs)
+print = _safe_print
+
 
 class ScrapeProgress:
     """

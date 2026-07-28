@@ -122,8 +122,24 @@ def save_config(data: dict):
 
 def get_default_output_folder() -> str:
     """获取默认输出文件夹：桌面/EtsyScraper_YYYYMMDD，自动复用同日期文件夹"""
-    desktop = Path.home() / "Desktop"
-    if not desktop.exists():
+    # 尝试获取桌面路径，支持多语言系统
+    desktop = None
+    
+    # 尝试常见的桌面路径
+    desktop_candidates = [
+        Path.home() / "Desktop",           # English
+        Path.home() / "桌面",               # Chinese (Simplified)
+        Path.home() / "桌面",               # Chinese (Traditional) - same
+        Path.home() / "OneDrive" / "Desktop",  # OneDrive backup
+    ]
+    
+    for candidate in desktop_candidates:
+        if candidate.exists():
+            desktop = candidate
+            break
+    
+    # 如果桌面路径都不存在，使用用户主目录
+    if desktop is None:
         desktop = Path.home()
     
     today = datetime.now().strftime("%Y%m%d")
@@ -135,13 +151,14 @@ def get_default_output_folder() -> str:
         return str(target_path)
     
     # 查找桌面上最近的 EtsyScraper_ 文件夹，如果存在则复用
-    existing = sorted(
-        [d for d in desktop.iterdir() if d.is_dir() and d.name.startswith("EtsyScraper_")],
-        key=lambda p: p.name,
-        reverse=True
-    )
-    if existing:
-        return str(existing[0])
+    if desktop.exists():
+        existing = sorted(
+            [d for d in desktop.iterdir() if d.is_dir() and d.name.startswith("EtsyScraper_")],
+            key=lambda p: p.name,
+            reverse=True
+        )
+        if existing:
+            return str(existing[0])
     
     # 没有已有文件夹，创建今天的
     target_path.mkdir(parents=True, exist_ok=True)

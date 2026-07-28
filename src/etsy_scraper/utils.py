@@ -5,9 +5,16 @@
 """
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List
+
+
+def safe_print(*args, **kwargs):
+    """安全打印，兼容 PyInstaller Windows 环境（stdout 可能为 None）"""
+    if sys.stdout is not None:
+        print(*args, **kwargs)
 
 
 # 图片格式魔数（文件头字节签名）

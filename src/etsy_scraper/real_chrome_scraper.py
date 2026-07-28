@@ -20,6 +20,14 @@ from typing import Optional, Dict, List
 
 import requests
 
+# 兼容 PyInstaller Windows 环境（stdout 可能为 None）
+_builtin_print = print
+def _safe_print(*args, **kwargs):
+    if sys.stdout is not None:
+        kwargs.setdefault('flush', True)
+        _builtin_print(*args, **kwargs)
+print = _safe_print
+
 
 def sanitize_filename(name: str) -> str:
     """清理文件名"""
@@ -37,12 +45,23 @@ def get_chrome_path() -> Optional[str]:
             "/Applications/Chromium.app/Contents/MacOS/Chromium",
         ]
     elif sys.platform == "win32":
+        # Windows 上支持多种安装路径
         paths = [
             os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
             os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Chromium\Application\chrome.exe"),
+            # Microsoft Edge (Chromium) - 备用
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
         ]
     else:
-        paths = ["/usr/bin/google-chrome", "/usr/bin/chromium-browser"]
+        paths = [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+        ]
 
     for p in paths:
         if os.path.exists(p):
@@ -70,7 +89,17 @@ def start_chrome_with_debug(url: str, port: int = 9222) -> subprocess.Popen:
         url
     ]
 
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Windows 上需要 CREATE_NO_WINDOW 标志来避免创建控制台窗口
+    if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = subprocess.CREATE_NO_WINDOW
+        return subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            startupinfo=startupinfo, creationflags=creationflags
+        )
+    else:
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def wait_for_chrome_ready(port: int = 9222, timeout: int = 30) -> bool:
@@ -93,7 +122,6 @@ def create_patched_driver(port: int = 9222):
     再用标准 Selenium 连接到已有的 Chrome 实例（通过 debuggerAddress）。
     自动检测 Chrome 版本以下载匹配的 chromedriver。
     """
-    import sys as _sys
     from selenium import webdriver
     from selenium.webdriver.chrome.options import Options
     from selenium.webdriver.chrome.service import Service
@@ -106,17 +134,16 @@ def create_patched_driver(port: int = 9222):
         browser_str = resp.json().get("Browser", "")
         if "/" in browser_str:
             version_main = int(browser_str.split("/")[1].split(".")[0])
-            print(f"  [driver] 检测到 Chrome 版本: {version_main}", flush=True)
+            print(f"  [driver] 检测到 Chrome 版本: {version_main}")
     except Exception:
-        print("  [driver] 无法检测 Chrome 版本，将使用默认值", flush=True)
+        print("  [driver] 无法检测 Chrome 版本，将使用默认值")
 
-    print("  [driver] 正在初始化反检测补丁（首次需下载 chromedriver，请稍候）...", flush=True)
+    print("  [driver] 正在初始化反检测补丁（首次需下载 chromedriver，请稍候）...")
     patcher = uc.Patcher(version_main=version_main)
     
     # 设置可执行权限（避免 Linux/Mac 上 permission denied）
-    _sys.stdout.flush()
     patcher.auto()
-    print(f"  [driver] 补丁完成: {patcher.executable_path}", flush=True)
+    print(f"  [driver] 补丁完成: {patcher.executable_path}")
 
     options = Options()
     options.add_experimental_option("debuggerAddress", f"localhost:{port}")
