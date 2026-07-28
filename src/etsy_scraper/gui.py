@@ -19,6 +19,22 @@ from typing import Optional, List, Set
 # 防止 PyInstaller 打包后 multiprocessing spawn 导致重复启动 GUI
 multiprocessing.freeze_support()
 
+# Windows 专用模块安全导入
+# 这些模块在 macOS/Linux 上不存在，但 PyInstaller 在 Windows 上可能需要它们
+if sys.platform == 'win32':
+    try:
+        import _overlapped  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import _socket  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import _ssl  # noqa: F401
+    except ImportError:
+        pass
+
 # 修复跨平台 SSL 证书问题
 try:
     import certifi

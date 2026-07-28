@@ -20,6 +20,21 @@ from typing import Optional, Dict, List
 
 import requests
 
+# Windows 专用模块安全导入
+if sys.platform == 'win32':
+    try:
+        import _overlapped  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import _socket  # noqa: F401
+    except ImportError:
+        pass
+    try:
+        import _ssl  # noqa: F401
+    except ImportError:
+        pass
+
 # 兼容 PyInstaller Windows 环境（stdout 可能为 None）
 _builtin_print = print
 def _safe_print(*args, **kwargs):
