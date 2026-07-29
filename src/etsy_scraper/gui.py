@@ -2,7 +2,6 @@
 Etsy Scraper GUI - CustomTkinter 桌面应用
 """
 import json
-import multiprocessing
 import os
 import random
 import re
@@ -16,24 +15,23 @@ from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Optional, List, Set
 
-# 防止 PyInstaller 打包后 multiprocessing spawn 导致重复启动 GUI
-multiprocessing.freeze_support()
+# 安全导入 multiprocessing（Windows PyInstaller 环境可能缺失 _multiprocessing）
+# 仅用于 freeze_support()，实际抓取使用线程
+try:
+    import multiprocessing
+    multiprocessing.freeze_support()
+    _has_multiprocessing = True
+except ImportError:
+    _has_multiprocessing = False
 
 # Windows 专用模块安全导入
 # 这些模块在 macOS/Linux 上不存在，但 PyInstaller 在 Windows 上可能需要它们
 if sys.platform == 'win32':
-    try:
-        import _overlapped  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import _socket  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import _ssl  # noqa: F401
-    except ImportError:
-        pass
+    for _mod_name in ['_overlapped', '_socket', '_ssl', '_multiprocessing', '_ctypes']:
+        try:
+            __import__(_mod_name)
+        except ImportError:
+            pass
 
 # 修复跨平台 SSL 证书问题
 try:

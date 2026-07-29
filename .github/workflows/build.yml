@@ -46,8 +46,40 @@ jobs:
         if: steps.cache-venv.outputs.cache-hit != 'true'
         run: poetry install --no-interaction
 
+      - name: Verify build hooks exist
+        run: |
+          echo "Checking build_hooks directory..."
+          ls -la build_hooks/
+          echo "Verifying hook files..."
+          test -f build_hooks/hook-etsy_scraper.py
+          test -f build_hooks/hook-runtime_fix.py
+          echo "✅ Build hooks verified"
+
       - name: Build with PyInstaller
         run: poetry run python build.py
+
+      - name: Verify Windows build output
+        if: matrix.os == 'windows-latest'
+        run: |
+          echo "Checking dist/EtsyScraper..."
+          ls -la dist/EtsyScraper/
+          echo ""
+          echo "Checking _multiprocessing.pyd..."
+          if (Test-Path "dist/EtsyScraper/_internal/_multiprocessing.pyd") {
+            echo "✅ _multiprocessing.pyd found in _internal"
+          } elseif (Test-Path "dist/EtsyScraper/_internal/_multiprocessing.pyd") {
+            echo "✅ _multiprocessing.pyd found"
+          } else {
+            echo "⚠️  _multiprocessing.pyd not found in expected locations"
+            echo "Searching for _multiprocessing..."
+            Get-ChildItem -Path dist/EtsyScraper -Recurse -Name "_multiprocessing*"
+          }
+          echo ""
+          echo "Checking _overlapped.pyd..."
+          Get-ChildItem -Path dist/EtsyScraper -Recurse -Name "_overlapped*" -ErrorAction SilentlyContinue
+          echo ""
+          echo "Checking python311.dll..."
+          Get-ChildItem -Path dist/EtsyScraper -Recurse -Name "python311*" -ErrorAction SilentlyContinue
 
       - name: Prepare macOS artifact
         if: matrix.os == 'macos-latest'

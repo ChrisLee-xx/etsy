@@ -12,7 +12,7 @@ Windows Build Instructions:
 
 Common Windows Issues & Fixes:
   - "Failed to load Python DLL": Ensure antivirus doesn't quarantine files
-  - "No module named '_overlapped'": This is now handled via hidden-import
+  - "No module named '_multiprocessing'": Handled via PyInstaller hooks + --collect-binaries
   - Missing chromedriver: Run the app once to auto-download, then include _internal
 """
 import os
@@ -29,7 +29,7 @@ APP_VERSION = "0.1.0"
 PROJECT_ROOT = Path(__file__).parent.absolute()
 SRC_DIR = PROJECT_ROOT / "src" / "etsy_scraper"
 
-# Runtime hooks directory
+# PyInstaller hooks directory (contains hook files for Windows C extensions)
 HOOKS_DIR = PROJECT_ROOT / "build_hooks"
 
 
@@ -48,44 +48,6 @@ def clean_build():
         print(f"Cleaning {spec_file.name}...")
 
 
-def create_runtime_hooks():
-    """Create runtime hooks for Windows compatibility"""
-    HOOKS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Hook 1: Ensure critical DLLs and modules are available
-    hook_content = '''
-# PyInstaller Runtime Hook for Windows Compatibility
-# This hook runs before any other code to ensure critical modules are available
-
-import sys
-import os
-
-# Ensure _internal directory is in the DLL search path on Windows
-if sys.platform == 'win32':
-    # Get the directory where the executable is located
-    if getattr(sys, 'frozen', False):
-        exe_dir = os.path.dirname(sys.executable)
-        internal_dir = os.path.join(exe_dir, '_internal')
-        
-        # Add _internal to PATH for DLL discovery
-        if os.path.isdir(internal_dir):
-            os.environ['PATH'] = internal_dir + os.pathsep + os.environ.get('PATH', '')
-        
-        # Add to DLL search directories
-        try:
-            if hasattr(os, 'add_dll_directory'):
-                os.add_dll_directory(exe_dir)
-                if os.path.isdir(internal_dir):
-                    os.add_dll_directory(internal_dir)
-        except (OSError, FileNotFoundError, AttributeError):
-            pass
-'''
-    
-    hook_file = HOOKS_DIR / "hook-runtime_fix.py"
-    hook_file.write_text(hook_content.strip(), encoding='utf-8')
-    print(f"Created runtime hook: {hook_file}")
-
-
 def build_app():
     """Build application"""
     print("=" * 60)
@@ -95,93 +57,16 @@ def build_app():
     # Detect OS
     if sys.platform == "darwin":
         platform_name = "macOS"
-        sep = ":"
     elif sys.platform == "win32":
         platform_name = "Windows"
-        sep = ";"
     else:
         platform_name = "Linux"
-        sep = ":"
     
     print(f"Target platform: {platform_name}")
     print()
     
-    # Create runtime hooks
-    create_runtime_hooks()
-    
-    # Main script and other modules
+    # Main script
     main_script = str(SRC_DIR / "gui.py")
-    
-    # Common hidden imports for all platforms
-    common_hidden_imports = [
-        # Our modules
-        "section_scraper",
-        "real_chrome_scraper",
-        "utils",
-        # Dependencies
-        "selenium",
-        "selenium.webdriver",
-        "selenium.webdriver.chrome.options",
-        "selenium.webdriver.chrome.service",
-        "selenium.webdriver.common.by",
-        "selenium.webdriver.common.action_chains",
-        "selenium.webdriver.support.ui",
-        "selenium.webdriver.support.expected_conditions",
-        "requests",
-        "urllib3",
-        "certifi",
-        "charset_normalizer",
-        "idna",
-        "customtkinter",
-        "undetected_chromedriver",
-        "undetected_chromedriver.patcher",
-        "PIL",
-        "PIL.Image",
-        "PIL._tkinter_finder",
-        "tkinter",
-        "tkinter.filedialog",
-        "tkinter.messagebox",
-        "json",
-        "threading",
-        "datetime",
-        "pathlib",
-        "platform",
-        "re",
-        "collections",
-        "subprocess",
-        # Standard library modules needed by asyncio/socket on Windows
-        "_overlapped",
-        "_socket",
-        "_ssl",
-        "_ctypes",
-        "ctypes",
-        "asyncio",
-        "selectors",
-        "socket",
-        "ssl",
-        "multiprocessing",
-        "multiprocessing.pool",
-        "concurrent",
-        "concurrent.futures",
-        "queue",
-        "threading",
-    ]
-    
-    # Windows-specific hidden imports
-    windows_hidden_imports = [
-        "winreg",
-        "winsound",
-        "msvcrt",
-        "win32api",
-        "win32con",
-        "win32process",
-        "win32security",
-        "ntdll",
-        "pywintypes",
-        "pythoncom",
-        "win32com",
-        "win32timezone",
-    ]
     
     pyinstaller_args = [
         "pyinstaller",
@@ -191,59 +76,89 @@ def build_app():
         "--noconfirm",
         "--clean",
         
-        # Add etsy_scraper directory to Python path so modules can be found directly
+        # Add etsy_scraper directory to Python path
         "--paths", str(SRC_DIR),
         
-        # Add runtime hooks
+        # Use custom hooks directory for Windows C extension modules
+        "--additional-hooks-dir", str(HOOKS_DIR),
+        
+        # Runtime hook: pre-loads critical modules before app code
         "--runtime-hook", str(HOOKS_DIR / "hook-runtime_fix.py"),
-    ]
-    
-    # Add common hidden imports
-    for imp in common_hidden_imports:
-        pyinstaller_args.extend(["--hidden-import", imp])
-    
-    # Add Windows-specific imports only on Windows
-    if sys.platform == "win32":
-        for imp in windows_hidden_imports:
-            pyinstaller_args.extend(["--hidden-import", imp])
-    
-    # Collect all resources for key packages
-    pyinstaller_args.extend([
+        
+        # Collect all resources for key packages
         "--collect-all", "customtkinter",
         "--collect-all", "undetected_chromedriver",
-    ])
+    ]
     
-    # Collect Python standard library for Windows (ensure _overlapped is included)
+    # === Windows-specific handling ===
     if sys.platform == "win32":
+        # Force-collect .pyd binary files from standard library
+        # This is the key fix for _multiprocessing, _overlapped, etc.
         pyinstaller_args.extend([
-            "--collect-submodules", "_overlapped",
-            "--collect-submodules", "_socket",
-            "--collect-submodules", "asyncio",
+            # Collect ALL binary extensions from Python standard library
+            "--collect-binaries", "asyncio",
+            "--collect-binaries", "multiprocessing",
+            "--collect-binaries", "socket",
+            "--collect-binaries", "ssl",
+            "--collect-binaries", "selectors",
+            "--collect-binaries", "subprocess",
+            "--collect-binaries", "concurrent",
+            "--collect-binaries", "ctypes",
         ])
+        
+        # Also collect the standard library DLLs directory
+        python_dir = os.path.dirname(sys.executable)
+        
+        # DLLs directory (Python 3.8+ stores .pyd files here)
+        dlls_dir = os.path.join(python_dir, "DLLs")
+        if os.path.isdir(dlls_dir):
+            # Add all .pyd files from DLLs directory
+            for filename in os.listdir(dlls_dir):
+                if filename.endswith('.pyd'):
+                    pyd_path = os.path.join(dlls_dir, filename)
+                    pyinstaller_args.extend(["--add-binary", f"{pyd_path};."])
+            print(f"Added {len([f for f in os.listdir(dlls_dir) if f.endswith('.pyd')])} .pyd files from DLLs/")
+        
+        # Lib directory (older Python versions or some .pyd files)
+        lib_dir = os.path.join(python_dir, "Lib")
+        if not os.path.isdir(lib_dir):
+            lib_dir = os.path.join(os.path.dirname(python_dir), "Lib")
+        
+        if os.path.isdir(lib_dir):
+            for filename in os.listdir(lib_dir):
+                if filename.endswith('.pyd'):
+                    pyd_path = os.path.join(lib_dir, filename)
+                    pyinstaller_args.extend(["--add-binary", f"{pyd_path};."])
+        
+        # Find and add python311.dll
+        python_dll = os.path.join(python_dir, "python311.dll")
+        if not os.path.exists(python_dll):
+            python_dll = os.path.join(os.path.dirname(python_dir), "python311.dll")
+        if not os.path.exists(python_dll):
+            # Check DLLs directory
+            python_dll = os.path.join(dlls_dir, "python311.dll")
+        
+        if os.path.exists(python_dll):
+            pyinstaller_args.extend(["--add-binary", f"{python_dll};."])
+            print(f"Added Python DLL: {os.path.basename(python_dll)}")
+        else:
+            print("Warning: python311.dll not found in expected locations")
+        
+        # Collect selenium's chromedriver binary
+        try:
+            import selenium
+            selenium_dir = os.path.dirname(selenium.__file__)
+            pyinstaller_args.extend(["--collect-binaries", "selenium"])
+        except Exception:
+            pass
     
-    pyinstaller_args.append(main_script)
-    
-    # macOS specific
+    # === macOS-specific ===
     if sys.platform == "darwin":
         pyinstaller_args.extend([
             "--osx-bundle-identifier", "com.etsy.scraper",
         ])
     
-    # Windows specific: add the Python DLL explicitly
-    if sys.platform == "win32":
-        # Find and add python311.dll from the Python installation
-        python_dir = os.path.dirname(sys.executable)
-        python_dll = os.path.join(python_dir, "python311.dll")
-        
-        # Also check for python311.dll in root of Python installation
-        if not os.path.exists(python_dll):
-            python_dll = os.path.join(os.path.dirname(python_dir), "python311.dll")
-        
-        if os.path.exists(python_dll):
-            pyinstaller_args.extend(["--add-binary", f"{python_dll};."])
-            print(f"Added Python DLL: {python_dll}")
-        else:
-            print("Warning: python311.dll not found, PyInstaller will bundle it automatically")
+    pyinstaller_args.append(main_script)
     
     print("Running PyInstaller...")
     print("-" * 40)
@@ -273,11 +188,11 @@ def build_app():
             print("\n" + "=" * 60)
             print("Windows Deployment Instructions:")
             print("=" * 60)
-            print("1. Copy the entire 'dist/EtsyScraper/' folder to the target machine")
+            print("1. Copy the ENTIRE 'dist/EtsyScraper/' folder (including _internal/)")
             print("2. Run 'EtsyScraper.exe' from within that folder")
-            print("3. Do NOT copy just the .exe file alone - the _internal folder is required")
+            print("3. NEVER copy just the .exe file alone - the _internal folder is required!")
             print("4. If antivirus quarantines files, add an exclusion for the folder")
-            print("5. First run may take a few seconds to start (Chrome auto-download)")
+            print("5. First run may take a few seconds (Chrome auto-download)")
 
 
 def main():
