@@ -47,12 +47,14 @@ jobs:
         run: poetry install --no-interaction
 
       - name: Verify build hooks exist
+        # Windows runner 默认用 PowerShell，显式指定 bash 以跨平台复用同一套语法
+        shell: bash
         run: |
           echo "Checking build_hooks directory..."
           ls -la build_hooks/
           echo "Verifying hook files..."
-          test -f build_hooks/hook-etsy_scraper.py
-          test -f build_hooks/hook-runtime_fix.py
+          test -f build_hooks/hook-etsy_scraper.py || { echo "❌ Missing hook-etsy_scraper.py"; exit 1; }
+          test -f build_hooks/hook-runtime_fix.py || { echo "❌ Missing hook-runtime_fix.py"; exit 1; }
           echo "✅ Build hooks verified"
 
       - name: Build with PyInstaller
@@ -60,26 +62,19 @@ jobs:
 
       - name: Verify Windows build output
         if: matrix.os == 'windows-latest'
+        shell: bash
         run: |
           echo "Checking dist/EtsyScraper..."
-          ls -la dist/EtsyScraper/
+          ls -la dist/EtsyScraper/ 2>/dev/null || { echo "❌ dist/EtsyScraper not found"; exit 1; }
           echo ""
           echo "Checking _multiprocessing.pyd..."
-          if (Test-Path "dist/EtsyScraper/_internal/_multiprocessing.pyd") {
-            echo "✅ _multiprocessing.pyd found in _internal"
-          } elseif (Test-Path "dist/EtsyScraper/_internal/_multiprocessing.pyd") {
-            echo "✅ _multiprocessing.pyd found"
-          } else {
-            echo "⚠️  _multiprocessing.pyd not found in expected locations"
-            echo "Searching for _multiprocessing..."
-            Get-ChildItem -Path dist/EtsyScraper -Recurse -Name "_multiprocessing*"
-          }
+          find dist/EtsyScraper -name "_multiprocessing*" 2>/dev/null || echo "  (not found)"
           echo ""
           echo "Checking _overlapped.pyd..."
-          Get-ChildItem -Path dist/EtsyScraper -Recurse -Name "_overlapped*" -ErrorAction SilentlyContinue
+          find dist/EtsyScraper -name "_overlapped*" 2>/dev/null || echo "  (not found)"
           echo ""
           echo "Checking python311.dll..."
-          Get-ChildItem -Path dist/EtsyScraper -Recurse -Name "python311*" -ErrorAction SilentlyContinue
+          find dist/EtsyScraper -name "python311*" 2>/dev/null || echo "  (not found)"
 
       - name: Prepare macOS artifact
         if: matrix.os == 'macos-latest'
