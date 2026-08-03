@@ -291,6 +291,30 @@ def is_shop_url(url: str) -> bool:
     return 'section_id' not in query_params
 
 
+def is_search_url(url: str) -> bool:
+    """判断是否为搜索页 URL（/search?q=...）"""
+    parsed = urlparse(url)
+    return '/search' in parsed.path
+
+
+def parse_search_url(url: str) -> str:
+    """
+    解析搜索页 URL，提取搜索关键词
+
+    支持格式:
+    - https://www.etsy.com/search?q=car+poster&ref=pagination&page=1
+    - https://www.etsy.com/search?q=car%20poster
+
+    Returns:
+        搜索关键词字符串（如 "car poster"），无 q 参数时返回 "search_results"
+    """
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    if 'q' in query_params and query_params['q'][0]:
+        return query_params['q'][0]
+    return "search_results"
+
+
 def get_shop_info(driver, shop_name: str) -> Tuple[str, int]:
     """
     从店铺页面获取信息：店铺显示名称 + 总商品数
@@ -358,9 +382,9 @@ def build_page_url(section_url: str, page: int) -> str:
 
 
 def extract_product_links(driver, section_url: str, total_items: int = 0,
-                          stop_check=None) -> List[str]:
+                          stop_check=None, max_count: int = -1) -> List[str]:
     """
-    从 Section 页面提取所有商品链接（基于 URL 参数翻页）
+    从 Section/搜索 页面提取所有商品链接（基于 URL 参数翻页）
     
     翻页策略：
     1. 先抓取第 1 页，获取实际每页商品数 (items_per_page)
@@ -369,9 +393,10 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
     
     Args:
         driver: Selenium WebDriver 实例
-        section_url: Section 页面 URL
-        total_items: Section 总商品数（用于计算总页数，0 则逐页探测）
+        section_url: Section/搜索 页面 URL
+        total_items: 总商品数（用于计算总页数，0 则逐页探测）
         stop_check: 可选的停止检查回调函数，返回 True 时提前退出翻页循环
+        max_count: 最大抓取数量，-1 表示无限（主要用于搜索页）
         
     Returns:
         商品 listing_id 列表
@@ -384,7 +409,12 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
     total_pages = None
     current_page = 1
     
-    print(f"\n📊 Section 总商品数: {total_items}" if total_items > 0 else "\n📊 总商品数未知，将逐页探测")
+    if max_count > 0:
+        print(f"\n📊 最大抓取数量: {max_count}（达到后自动停止）")
+    elif total_items > 0:
+        print(f"\n📊 Section 总商品数: {total_items}")
+    else:
+        print(f"\n📊 总商品数未知，将逐页探测")
     
     while True:
         # 检查停止信号
@@ -426,11 +456,17 @@ def extract_product_links(driver, section_url: str, total_items: int = 0,
                     page_ids.append(listing_id)
                     all_listing_ids.append(listing_id)
             
-            print(f"  ✓ 本页找到 {len(page_ids)} 个新商品")
+            print(f"  ✓ 本页找到 {len(page_ids)} 个新商品（累计 {len(all_listing_ids)}）")
             
             # 如果本页无新商品，停止翻页
             if not page_ids:
                 print("  → 本页无新商品，停止翻页")
+                break
+            
+            # 达到最大抓取数量，截断并停止
+            if max_count > 0 and len(all_listing_ids) >= max_count:
+                all_listing_ids = all_listing_ids[:max_count]
+                print(f"  → 已达到最大抓取数量 {max_count}，停止翻页")
                 break
             
             # 第一页抓取完成后，动态计算每页商品数和总页数

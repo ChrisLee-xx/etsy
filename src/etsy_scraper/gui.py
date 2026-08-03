@@ -187,7 +187,8 @@ class ScraperWorker:
                  filter_words: Optional[List[str]] = None,
                  delay: float = 2.0,
                  resume: bool = True,
-                 port: int = 9222):
+                 port: int = 9222,
+                 max_count: int = -1):
         self.app = app
         self.mode = mode
         self.urls = urls
@@ -197,6 +198,7 @@ class ScraperWorker:
         self.delay = delay
         self.resume = resume
         self.port = port
+        self.max_count = max_count
         self.chrome_process = None
         self.driver = None
         self._stop_flag = False
@@ -425,20 +427,31 @@ class ScraperWorker:
         stopped_early = False
         
         try:
-            from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info
+            from etsy_scraper.section_scraper import (
+                is_shop_url, parse_section_url, parse_shop_url, get_shop_info,
+                is_search_url, parse_search_url
+            )
         except ImportError:
-            from section_scraper import is_shop_url, parse_section_url, parse_shop_url, get_shop_info  # type: ignore
+            from section_scraper import (  # type: ignore
+                is_shop_url, parse_section_url, parse_shop_url, get_shop_info,
+                is_search_url, parse_search_url
+            )
         
         for sec_idx, url in enumerate(self.urls, 1):
             if self._stop_flag:
                 stopped_early = True
                 break
             
-            # 区分店铺链接和 Section 链接
-            is_shop = is_shop_url(url)
+            # 区分搜索链接、店铺链接和 Section 链接
+            is_search = is_search_url(url)
+            is_shop = is_shop_url(url) if not is_search else False
             
             try:
-                if is_shop:
+                if is_search:
+                    search_query = parse_search_url(url)
+                    shop_name = search_query
+                    section_id = "search"
+                elif is_shop:
                     shop_name = parse_shop_url(url)
                     section_id = "ALL"  # 店铺全品类用特殊标识
                 else:
@@ -447,7 +460,7 @@ class ScraperWorker:
                 self.log(f"\n❌ 无效 URL: {url}")
                 continue
             
-            label = f"店铺" if is_shop else f"Section"
+            label = f"搜索" if is_search else (f"店铺" if is_shop else f"Section")
             self.log(f"\n[{label} {sec_idx}/{total_sections}] {shop_name}")
             
             if sec_idx > 1:
@@ -461,42 +474,55 @@ class ScraperWorker:
                         self.chrome_process = self.ctx.chrome_process
                         self.log("  ✅ 已恢复")
                     else:
-                        self.log("  ❌ 无法恢复，跳过此 {label}")
+                        self.log(f"  ❌ 无法恢复，跳过此 {label}")
                         continue
             
             # 获取信息（在创建输出目录之前），Chrome 断连时自动恢复
-            try:
-                if is_shop:
-                    display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
-                else:
-                    try:
-                        from etsy_scraper.section_scraper import get_section_info
-                    except ImportError:
-                        from section_scraper import get_section_info  # type: ignore
-                    display_name, total_items = get_section_info(self.ctx.driver, section_id)
-            except Exception as e:
-                self.log(f"  ❌ 获取{label}信息失败: {e}，尝试重启 Chrome...")
-                if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
-                    self.driver = self.ctx.driver
-                    self.chrome_process = self.ctx.chrome_process
-                    self.log("  ✅ 已恢复，重试...")
-                    try:
-                        if is_shop:
-                            display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
-                        else:
-                            display_name, total_items = get_section_info(self.ctx.driver, section_id)
-                    except Exception as retry_error:
-                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 {label}")
+            # 搜索页跳过信息获取（总数不可靠，用 max_count 控制抓取量）
+            display_name = shop_name
+            total_items = 0
+            if not is_search:
+                try:
+                    if is_shop:
+                        display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
+                    else:
+                        try:
+                            from etsy_scraper.section_scraper import get_section_info
+                        except ImportError:
+                            from section_scraper import get_section_info  # type: ignore
+                        display_name, total_items = get_section_info(self.ctx.driver, section_id)
+                except Exception as e:
+                    self.log(f"  ❌ 获取{label}信息失败: {e}，尝试重启 Chrome...")
+                    if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
+                        self.driver = self.ctx.driver
+                        self.chrome_process = self.ctx.chrome_process
+                        self.log("  ✅ 已恢复，重试...")
+                        try:
+                            if is_shop:
+                                display_name, total_items = get_shop_info(self.ctx.driver, shop_name)
+                            else:
+                                display_name, total_items = get_section_info(self.ctx.driver, section_id)
+                        except Exception as retry_error:
+                            self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 {label}")
+                            continue
+                    else:
+                        self.log(f"  ❌ 无法恢复，跳过此 {label}")
                         continue
+            else:
+                # 搜索页显示 max_count 信息
+                if self.max_count > 0:
+                    self.log(f"  🔍 搜索: {search_query}（最多抓取 {self.max_count} 个）")
                 else:
-                    self.log(f"  ❌ 无法恢复，跳过此 {label}")
-                    continue
+                    self.log(f"  🔍 搜索: {search_query}（无限抓取）")
             
-            info_label = f"{label}: {display_name}" if not is_shop or display_name != shop_name else f"店铺: {shop_name}"
-            self.log(f"  {info_label} ({total_items} 件)")
+            if not is_search:
+                info_label = f"{label}: {display_name}" if not is_shop or display_name != shop_name else f"店铺: {shop_name}"
+                self.log(f"  {info_label} ({total_items} 件)")
             
             # 命名文件夹
-            if is_shop:
+            if is_search:
+                dir_name = sanitize_folder_name(search_query) or "search_results"
+            elif is_shop:
                 dir_name = sanitize_folder_name(shop_name) + "_ALL"
             elif display_name and display_name != "section":
                 dir_name = sanitize_folder_name(display_name)
@@ -529,81 +555,212 @@ class ScraperWorker:
                 except Exception:
                     pass
             
-            try:
-                listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
-                                                     stop_check=lambda: self._stop_flag)
-            except Exception as e:
-                self.log(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
-                if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
+            if is_search:
+                # 搜索页：逐页抓取处理（抓一页处理一页，不预先收集所有 ID）
+                # 这样即使中途被封锁，已处理页的图片已经保存
+                try:
+                    from etsy_scraper.section_scraper import build_page_url, scroll_page
+                except ImportError:
+                    from section_scraper import build_page_url, scroll_page  # type: ignore
+                from selenium.webdriver.common.by import By
+                
+                name_tracker = ImageNameTracker()
+                consecutive_fails = 0
+                current_page = 1
+                seen_ids = set(completed_ids)
+                total_processed = len(completed_ids)
+                
+                if self.max_count > 0:
+                    progress.set_total_found(self.max_count)
+                    self.update_progress(total_processed, self.max_count)
+                
+                while not self._stop_flag:
+                    # 构造当前页 URL 并导航
+                    page_url = build_page_url(url, current_page)
+                    self.log(f"\n  📄 第 {current_page} 页...")
+                    
+                    try:
+                        self.ctx.driver.get(page_url)
+                        time.sleep(3)
+                        scroll_page(self.ctx.driver)
+                    except Exception as e:
+                        if _is_browser_disconnected(e):
+                            self.log(f"  🔌 Chrome 断连，重启后重试当前页...")
+                            if self.ctx.handle_block(page_url, section_url=url, immediate=True):
+                                self.driver = self.ctx.driver
+                                self.chrome_process = self.ctx.chrome_process
+                                continue
+                            else:
+                                self.log("  ❌ 无法恢复，停止")
+                                stopped_early = True
+                                break
+                        else:
+                            self.log(f"  ❌ 页面加载失败: {e}")
+                            break
+                    
+                    # 提取本页 listing_id
+                    try:
+                        product_cards = self.ctx.driver.find_elements(
+                            By.CSS_SELECTOR, 'div.v2-listing-card[data-listing-id]'
+                        )
+                        page_ids = []
+                        for card in product_cards:
+                            lid = card.get_attribute('data-listing-id')
+                            if lid and lid not in seen_ids:
+                                seen_ids.add(lid)
+                                page_ids.append(lid)
+                    except Exception as e:
+                        if _is_browser_disconnected(e):
+                            self.log(f"  🔌 Chrome 断连，重启后重试当前页...")
+                            if self.ctx.handle_block(page_url, section_url=url, immediate=True):
+                                self.driver = self.ctx.driver
+                                self.chrome_process = self.ctx.chrome_process
+                                continue
+                            else:
+                                self.log("  ❌ 无法恢复，停止")
+                                stopped_early = True
+                                break
+                        else:
+                            self.log(f"  ❌ 提取商品失败: {e}")
+                            break
+                    
+                    self.log(f"  ✓ 本页 {len(page_ids)} 个新商品（累计 {total_processed}）")
+                    
+                    if not page_ids:
+                        self.log("  → 无更多商品，停止")
+                        break
+                    
+                    # 立即处理本页商品（下载图片）
+                    for listing_id in page_ids:
+                        if self._stop_flag:
+                            break
+                        
+                        if self.max_count > 0 and total_processed >= self.max_count:
+                            self.log(f"  → 已达到最大抓取数 {self.max_count}")
+                            break
+                        
+                        if progress.is_completed(listing_id):
+                            continue
+                        
+                        self.log(f"  [{total_processed + 1}] 处理商品 {listing_id}...")
+                        
+                        if process_product(self.ctx, listing_id, output_path, name_tracker,
+                                          image_selection=self.image_selection,
+                                          filter_words=self.filter_words,
+                                          section_url=url):
+                            total_success += 1
+                            consecutive_fails = 0
+                            progress.save(listing_id)
+                            self.log(f"    ✅ 完成")
+                        else:
+                            total_fail += 1
+                            consecutive_fails += 1
+                            self.log(f"    ❌ 失败")
+                            
+                            if consecutive_fails >= 3:
+                                product_url = f"https://www.etsy.com/listing/{listing_id}"
+                                self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁，自动重启 Chrome...")
+                                if self.ctx.handle_block(product_url, section_url=url):
+                                    self.log("✅ 已恢复，继续抓取")
+                                    consecutive_fails = 0
+                                else:
+                                    self.log("❌ 无法恢复，停止")
+                                    stopped_early = True
+                                    break
+                        
+                        total_processed += 1
+                        self.driver = self.ctx.driver
+                        self.chrome_process = self.ctx.chrome_process
+                        
+                        if self.max_count > 0:
+                            self.update_progress(total_processed, self.max_count)
+                        
+                        time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
+                    
+                    # 检查是否达到 max_count
+                    if self.max_count > 0 and total_processed >= self.max_count:
+                        break
+                    
+                    current_page += 1
+                    time.sleep(2)
+                
+            else:
+                # shop/section：保持原有的"先收集再处理"模式
+                try:
+                    listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
+                                                         stop_check=lambda: self._stop_flag)
+                except Exception as e:
+                    self.log(f"  ❌ 提取商品链接失败: {e}，尝试重启 Chrome...")
+                    if self.ctx.handle_block(url, section_url=url, immediate=_is_browser_disconnected(e)):
+                        self.driver = self.ctx.driver
+                        self.chrome_process = self.ctx.chrome_process
+                        self.log("  ✅ 已恢复，重试...")
+                        try:
+                            listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
+                                                                 stop_check=lambda: self._stop_flag)
+                        except Exception as retry_error:
+                            self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 {label}")
+                            continue
+                    else:
+                        self.log(f"  ❌ 无法恢复，跳过此 {label}")
+                        continue
+                
+                if not listing_ids:
+                    self.log("  ❌ 没有找到商品")
+                    continue
+                
+                self.log(f"  ✅ 找到 {len(listing_ids)} 个商品")
+                progress.set_total_found(len(listing_ids))
+                
+                pending_ids = [lid for lid in listing_ids if lid not in completed_ids]
+                
+                if not pending_ids:
+                    self.log("  ✅ 全部完成")
+                    continue
+                
+                name_tracker = ImageNameTracker()
+                consecutive_fails = 0
+                
+                for i, listing_id in enumerate(pending_ids, 1):
+                    if self._stop_flag:
+                        break
+                    
+                    self.update_progress(i, len(pending_ids))
+                    self.log(f"  [{i}/{len(pending_ids)}] 处理商品 {listing_id}...")
+                    
+                    if process_product(self.ctx, listing_id, output_path, name_tracker,
+                                      image_selection=self.image_selection,
+                                      filter_words=self.filter_words,
+                                      section_url=url):
+                        total_success += 1
+                        consecutive_fails = 0
+                        progress.save(listing_id)
+                        self.log(f"    ✅ [{i}/{len(pending_ids)}] 完成")
+                    else:
+                        total_fail += 1
+                        consecutive_fails += 1
+                        self.log(f"    ❌ [{i}/{len(pending_ids)}] 失败")
+                        
+                        if consecutive_fails >= 3:
+                            product_url = f"https://www.etsy.com/listing/{listing_id}"
+                            self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁，自动重启 Chrome...")
+                            if self.ctx.handle_block(product_url, section_url=url):
+                                self.log("✅ 已恢复，继续抓取")
+                                consecutive_fails = 0
+                            else:
+                                self.log("❌ 无法恢复，停止当前 Section")
+                                stopped_early = True
+                                break
+
+                    # driver 可能在封锁恢复后被替换，同步引用
                     self.driver = self.ctx.driver
                     self.chrome_process = self.ctx.chrome_process
-                    self.log("  ✅ 已恢复，重试...")
-                    try:
-                        listing_ids = extract_product_links(self.ctx.driver, url, total_items=total_items,
-                                                             stop_check=lambda: self._stop_flag)
-                    except Exception as retry_error:
-                        self.log(f"  ❌ 重试仍失败: {retry_error}，跳过此 {label}")
-                        continue
-                else:
-                    self.log(f"  ❌ 无法恢复，跳过此 {label}")
-                    continue
-            
-            if not listing_ids:
-                self.log("  ❌ 没有找到商品")
-                continue
-            
-            self.log(f"  ✅ 找到 {len(listing_ids)} 个商品")
-            progress.set_total_found(len(listing_ids))
-            
-            pending_ids = [lid for lid in listing_ids if lid not in completed_ids]
-            
-            if not pending_ids:
-                self.log("  ✅ 全部完成")
-                continue
-            
-            name_tracker = ImageNameTracker()
-            consecutive_fails = 0
-            
-            for i, listing_id in enumerate(pending_ids, 1):
-                if self._stop_flag:
-                    break
-                
-                self.update_progress(i, len(pending_ids))
-                self.log(f"  [{i}/{len(pending_ids)}] 处理商品 {listing_id}...")
-                
-                if process_product(self.ctx, listing_id, output_path, name_tracker,
-                                  image_selection=self.image_selection,
-                                  filter_words=self.filter_words,
-                                  section_url=url):
-                    total_success += 1
-                    consecutive_fails = 0
-                    progress.save(listing_id)
-                    self.log(f"    ✅ [{i}/{len(pending_ids)}] 完成")
-                else:
-                    total_fail += 1
-                    consecutive_fails += 1
-                    self.log(f"    ❌ [{i}/{len(pending_ids)}] 失败")
                     
-                    if consecutive_fails >= 3:
-                        product_url = f"https://www.etsy.com/listing/{listing_id}"
-                        self.log(f"\n⚠️ 连续 {consecutive_fails} 个失败，疑似被封锁，自动重启 Chrome...")
-                        if self.ctx.handle_block(product_url, section_url=url):
-                            self.log("✅ 已恢复，继续抓取")
-                            consecutive_fails = 0
-                        else:
-                            self.log("❌ 无法恢复，停止当前 Section")
-                            stopped_early = True
-                            break
-
-                # driver 可能在封锁恢复后被替换，同步引用
-                self.driver = self.ctx.driver
-                self.chrome_process = self.ctx.chrome_process
+                    if i < len(pending_ids):
+                        time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
                 
-                if i < len(pending_ids):
-                    time.sleep(max(1.0, self.delay + random.uniform(-0.5, 1.0)))
-            
-            if not self._stop_flag:
-                self.update_progress(len(pending_ids), len(pending_ids))
+                if not self._stop_flag:
+                    self.update_progress(len(pending_ids), len(pending_ids))
         
         # 区分正常完成和提前退出（stop 或连续失败）
         if stopped_early or self._stop_flag:
@@ -834,7 +991,7 @@ class App(ctk.CTk):
         subtitle_label.pack(anchor="w")
         
         # ========== Tab ==========
-        self.tabview = ctk.CTkTabview(self.main_frame, height=320)
+        self.tabview = ctk.CTkTabview(self.main_frame, height=340)
         self.tabview.pack(fill="x", pady=(0, 15))
         
         self.tabview.add("📂 批量抓取")
@@ -991,7 +1148,7 @@ class App(ctk.CTk):
         # URL 输入
         url_label = ctk.CTkLabel(
             parent,
-            text="店铺/Section 链接（多个链接换行分隔）：",
+            text="店铺/Section/搜索 链接（多个链接换行分隔）：",
             font=ctk.CTkFont(size=14, weight="bold")
         )
         url_label.pack(anchor="w", pady=(10, 5))
@@ -1041,7 +1198,7 @@ class App(ctk.CTk):
         )
         self.section_filter.pack(side="left", fill="x", expand=True)
         
-        # 第四行：延迟、端口、断点续传
+        # 第四行：延迟、抓取数量、端口、断点续传
         row4 = ctk.CTkFrame(options_frame, fg_color="transparent")
         row4.pack(fill="x", pady=8)
         
@@ -1050,7 +1207,15 @@ class App(ctk.CTk):
         self.section_delay.pack(side="left")
         self.section_delay.insert(0, "2.0")
         
-        ctk.CTkLabel(row4, text="Chrome端口：", font=ctk.CTkFont(size=14), width=120).pack(side="left", padx=(30, 0))
+        ctk.CTkLabel(row4, text="最大抓取数：", font=ctk.CTkFont(size=14), width=110).pack(side="left", padx=(30, 0))
+        self.section_max_count = ctk.CTkEntry(
+            row4, font=ctk.CTkFont(size=14), height=40, width=80,
+            placeholder_text="-1 无限"
+        )
+        self.section_max_count.pack(side="left")
+        self.section_max_count.insert(0, "-1")
+        
+        ctk.CTkLabel(row4, text="端口：", font=ctk.CTkFont(size=14), width=60).pack(side="left", padx=(30, 0))
         self.section_port = ctk.CTkEntry(row4, font=ctk.CTkFont(size=14), height=40, width=80)
         self.section_port.pack(side="left")
         self.section_port.insert(0, "9222")
@@ -1060,7 +1225,7 @@ class App(ctk.CTk):
             text="断点续传",
             font=ctk.CTkFont(size=14)
         )
-        self.section_resume.pack(side="left", padx=(30, 0))
+        self.section_resume.pack(side="left", padx=(20, 0))
         self.section_resume.select()
         
         # 开始按钮
@@ -1148,7 +1313,7 @@ class App(ctk.CTk):
     def start_section_scrape(self):
         urls_text = self.section_urls.get("0.0", "end").strip()
         if not urls_text:
-            messagebox.showwarning("提示", "请输入 Section 或店铺链接！")
+            messagebox.showwarning("提示", "请输入 Section、店铺或搜索链接！")
             return
         
         # 清理 URL：去除每行首尾空白，合并被换行截断的 URL
@@ -1162,17 +1327,17 @@ class App(ctk.CTk):
             else:
                 urls.append(line)
         
-        # 验证：支持 Section 链接（含 section_id）或 店铺链接（/shop/xxx）
+        # 验证：支持 Section 链接（含 section_id）、店铺链接（/shop/xxx）、搜索链接（/search）
         try:
-            from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url
+            from etsy_scraper.section_scraper import is_shop_url, parse_section_url, parse_shop_url, is_search_url
         except ImportError:
-            from section_scraper import is_shop_url, parse_section_url, parse_shop_url  # type: ignore
+            from section_scraper import is_shop_url, parse_section_url, parse_shop_url, is_search_url  # type: ignore
         for url in urls:
             if 'etsy.com' not in url:
                 messagebox.showerror("错误", f"无效链接（非 Etsy）:\n{url}")
                 return
-            if '/shop/' not in url and 'section_id=' not in url:
-                messagebox.showerror("错误", f"无效链接:\n{url}\n\n支持格式:\n- Section: .../shop/xxx?section_id=yyy\n- 店铺:   .../shop/xxx")
+            if '/shop/' not in url and 'section_id=' not in url and '/search' not in url:
+                messagebox.showerror("错误", f"无效链接:\n{url}\n\n支持格式:\n- Section: .../shop/xxx?section_id=yyy\n- 店铺:   .../shop/xxx\n- 搜索:   .../search?q=关键词")
                 return
         
         image_selection = None
@@ -1192,8 +1357,9 @@ class App(ctk.CTk):
         try:
             delay = float(self.section_delay.get())
             port = int(self.section_port.get())
+            max_count = int(self.section_max_count.get())
         except ValueError:
-            messagebox.showerror("错误", "延迟和端口必须是数字！")
+            messagebox.showerror("错误", "延迟、端口和抓取数必须是数字！")
             return
         
         self.start_worker(
@@ -1204,7 +1370,8 @@ class App(ctk.CTk):
             filter_words=filter_words,
             delay=delay,
             resume=self.section_resume.get(),
-            port=port
+            port=port,
+            max_count=max_count
         )
     
     def start_worker(self, **kwargs):
