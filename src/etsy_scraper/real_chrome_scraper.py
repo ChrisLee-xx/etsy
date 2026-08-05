@@ -104,12 +104,14 @@ def start_chrome_with_debug(url: str, port: int = 9222) -> subprocess.Popen:
         url
     ]
 
-    # Windows 上使用 CREATE_NO_WINDOW 阻止控制台窗口弹出
-    # 注意：不要使用 STARTF_USESHOWWINDOW，否则会隐藏 Chrome 的 GUI 窗口
+    # Windows 上需要 CREATE_NO_WINDOW 标志来避免创建控制台窗口
     if sys.platform == "win32":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        creationflags = subprocess.CREATE_NO_WINDOW
         return subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            startupinfo=startupinfo, creationflags=creationflags
         )
     else:
         return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
