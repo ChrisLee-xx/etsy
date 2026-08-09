@@ -375,7 +375,13 @@ class ScraperWorker:
                     result = None
 
             if not result or not result.get('title'):
-                self.log("  ❌ 抓取失败！")
+                # 带具体失败原因（extract 返回的 _error 字段），方便用户判断失败类型
+                fail_reason = ""
+                if isinstance(result, dict) and result.get('_error'):
+                    fail_reason = f"（{result['_error']}）"
+                else:
+                    fail_reason = "（未提取到商品标题，可能是页面未加载或非商品页）"
+                self.log(f"  ❌ 抓取失败{fail_reason}")
                 fail_count += 1
                 consecutive_fails += 1
 

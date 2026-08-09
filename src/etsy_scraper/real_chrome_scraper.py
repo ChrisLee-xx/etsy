@@ -576,65 +576,142 @@ def _extract_product_images(driver) -> List[str]:
 
 # ────────────── 数据提取 ──────────────
 
+def _try_get_title_text(driver) -> Optional[str]:
+    """尝试从商品页获取标题文本，失败返回 None。"""
+    from selenium.webdriver.common.by import By
+    selectors = [
+        'h1[data-buy-box-listing-title="true"]',
+        'h1[data-buy-box-listing-title]',
+        'h1',
+    ]
+    for sel in selectors:
+        try:
+            els = driver.find_elements(By.CSS_SELECTOR, sel)
+            for el in els:
+                try:
+                    text = el.get_attribute('textContent').strip()
+                except Exception:
+                    text = el.text.strip()
+                if text and len(text) > 5:
+                    # 排除验证/错误占位标题
+                    if any(k in text.lower() for k in ["captcha", "verify", "robot"]):
+                        continue
+                    return text
+        except Exception:
+            continue
+    return None
+
+
 def extract_data_with_selenium(driver) -> Optional[Dict]:
     """
     使用已有的 Selenium driver 提取 Etsy 商品数据（标题、店铺、价格、图片等）。
+    
+    返回的 dict 中带 '_error' 字段表示失败原因（仅诊断用，正常数据不含此字段）。
     """
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    def _fail(reason: str):
+        print(f"  ✗ 提取失败原因: {reason}")
+        return {"_error": reason}
 
     try:
         current_url = driver.current_url
         print(f"当前页面: {current_url}")
 
-        # 检查是否是有效的 Etsy 产品页面
+        # 先判断页面是否加载完成；若还在加载中则等待
+        try:
+            ready_state = driver.execute_script("return document.readyState")
+            print(f"  page.readyState = {ready_state}")
+            if ready_state not in ("complete", "interactive"):
+                print("  ⏳ 页面仍在加载，等待 readyState=complete...")
+                WebDriverWait(driver, 20).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                print("  ✅ 页面加载完成")
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
+            print(f"  ⚠️ 等待页面加载超时: {e}")
+
+        # 检测是否被 Etsy 限速/封禁（中英文都判断）
+        page_text = ""
+        try:
+            page_text = driver.execute_script(
+                "return (document.body ? document.body.innerText : '') || ''"
+            )[:3000]
+            low = page_text.lower()
+            if any(k in low for k in [
+                "unusual traffic", "verify you're a human", "robot check",
+                "访问暂时受限", "验证码", "are you a robot",
+            ]):
+                print("  🚫 检测到 Etsy 访问限制/验证码页面")
+                return _fail("Etsy 访问受限或出现验证码页面")
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
+
+        # 检查是否是失效/被删除的商品页
+        try:
+            page_text_short = page_text or ""
+            if any(k in page_text_short for k in [
+                "this listing is no longer available", "not found",
+                "item is unavailable", "商品已下架", "不存在",
+            ]):
+                print("  ⚠️ 商品已失效或被删除")
+                return _fail("商品已失效或被删除")
+        except Exception:
+            pass
+
+        # 等待商品标题渲染（Etsy 是 React SPA，h1 常需数秒才出现）
+        title_found = None
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: _try_get_title_text(d) is not None
+            )
+            title_found = _try_get_title_text(driver)
+        except Exception as e:
+            if _is_browser_disconnected(e):
+                raise
+            # 15 秒内标题未出现
+            try:
+                body_text = driver.find_element(By.TAG_NAME, 'body').text or ''
+            except Exception:
+                body_text = ''
+            print(f"  ⚠️ 等待标题渲染超时，body 片段: {body_text[:200]!r}")
+            return _fail(f"页面加载 15 秒后标题仍未渲染（body='{body_text[:60]}'）")
+
+        # 检查是否是有效的 Etsy 产品页面（用标题兜底判断）
         is_product_page = False
+        if title_found:
+            is_product_page = True
 
         product_indicators = [
-            'h1[data-buy-box-listing-title="true"]',
             'div[data-appears-component-name="listing_page"]',
             'div.listing-page-image-carousel',
             'button[data-add-to-cart-button]',
             'div[data-buy-box-region="price"]',
         ]
-
-        for selector in product_indicators:
-            try:
-                el = driver.find_element(By.CSS_SELECTOR, selector)
-                if el:
-                    is_product_page = True
-                    print(f"✓ 检测到产品页面元素: {selector}")
-                    break
-            except Exception:
-                continue
-
         if not is_product_page:
-            if '/listing/' in current_url:
+            for selector in product_indicators:
                 try:
-                    h1 = driver.find_element(By.TAG_NAME, 'h1')
-                    h1_text = h1.get_attribute('textContent').strip()
-                    if h1_text and len(h1_text) > 5 and '验证' not in h1_text:
+                    el = driver.find_element(By.CSS_SELECTOR, selector)
+                    if el:
                         is_product_page = True
-                        print(f"✓ 检测到产品标题: {h1_text[:50]}...")
+                        print(f"✓ 检测到产品页面元素: {selector}")
+                        break
                 except Exception:
-                    pass
+                    continue
 
         if not is_product_page:
             print("⚠️  未检测到产品页面元素，跳过")
-            return None
+            return _fail("未检测到产品页面元素（可能非商品页或被限速）")
 
         print("提取数据...")
         data = {}
 
-        # 标题
-        try:
-            title_el = driver.find_element(By.CSS_SELECTOR, 'h1[data-buy-box-listing-title="true"]')
-            data['title'] = title_el.get_attribute('textContent').strip()
-        except Exception:
-            try:
-                title_el = driver.find_element(By.TAG_NAME, 'h1')
-                data['title'] = title_el.get_attribute('textContent').strip()
-            except Exception:
-                data['title'] = None
+        # 标题（用已等待到的标题）
+        data['title'] = title_found
 
         # 店铺
         try:
@@ -668,7 +745,7 @@ def extract_data_with_selenium(driver) -> Optional[Dict]:
         if _is_browser_disconnected(e):
             raise
         print(f"  ✗ 提取失败: {e}")
-        return None
+        return {"_error": f"提取异常: {type(e).__name__}: {e}"}
 
 
 def download_images(images: List[str], title: str, output_dir: Path,
@@ -911,7 +988,13 @@ def main():
                     result = None
 
             if not result or not result.get('title'):
-                print(f"\n❌ 抓取失败！")
+                # 带具体失败原因（extract 返回的 _error 字段）
+                fail_reason = ""
+                if isinstance(result, dict) and result.get('_error'):
+                    fail_reason = f"（{result['_error']}）"
+                else:
+                    fail_reason = "（未提取到商品标题，可能是页面未加载或非商品页）"
+                print(f"\n❌ 抓取失败{fail_reason}")
                 fail_count += 1
                 consecutive_fails += 1
 
